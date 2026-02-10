@@ -4,6 +4,8 @@
 Trích xuất subtitle từ ~1500 video bài giảng tiếng Việt trên Google Drive,
 lưu JSON/SRT/MP3 lên Drive, sau đó import vào PostgreSQL để tìm kiếm.
 
+**Engine:** faster-whisper (CTranslate2) + Silero VAD → chính xác, nhanh gấp 4x vanilla Whisper.
+
 ---
 
 ## 📁 Cấu trúc project
@@ -189,11 +191,11 @@ tmux attach -t transcribe    ← Quay lại xem
 | Độ dài TB | ~1 giờ/video |
 | GPU | Tesla T4 (15GB VRAM) |
 | Model | large-v3 |
-| Thời gian transcribe | ~10-15 phút/video |
+| Thời gian transcribe | ~3-8 phút/video (faster-whisper + VAD) |
 | Thời gian download+extract | ~3-5 phút/video (chạy song song) |
-| Tổng thời gian | ~250-375 giờ (~10-16 ngày) |
+| Tổng thời gian | ~100-200 giờ (~4-8 ngày) |
 | Chi phí Spot VM | ~$0.35/giờ |
-| Tổng chi phí | ~$87-131 (trong $300 credit) |
+| Tổng chi phí | ~$35-70 (trong $300 credit) |
 
 ---
 

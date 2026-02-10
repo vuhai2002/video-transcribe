@@ -2,10 +2,11 @@
 """
 Video Transcription Pipeline (Spot Instance Safe)
 ===================================================
-Tự động tải video từ Google Drive, tách audio, transcribe bằng Whisper,
-upload kết quả (JSON, SRT, MP3) lên Drive, và dọn dẹp.
+Tự động tải video từ Google Drive, tách audio, transcribe bằng faster-whisper
+(với Silero VAD), upload kết quả (JSON, SRT, MP3) lên Drive, và dọn dẹp.
 
 Tính năng:
+- faster-whisper + Silero VAD: Transcription chính xác, chống hallucination
 - Pipeline gối đầu: Tải Video B trong khi Transcribe Video A
 - Checkpoint trên Google Drive: An toàn khi Spot Instance bị thu hồi
 - Auto-resume: Tự động tiếp tục từ video cuối cùng khi VM khởi động lại
@@ -360,11 +361,18 @@ def extract_audio(video_path, audio_path, logger):
     ]
     
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=600)
         elapsed = time.time() - start
         size_mb = os.path.getsize(audio_path) / (1024 * 1024)
         logger.info(f"🎵 Audio extracted: {Path(audio_path).name} ({size_mb:.1f} MB in {elapsed:.1f}s)")
         return True
+    except subprocess.TimeoutExpired:
+        elapsed = time.time() - start
+        logger.error(f"🎵 FFmpeg TIMEOUT (>10min) for {Path(video_path).name} ({elapsed:.1f}s)")
+        # Clean up partial audio file
+        if os.path.exists(audio_path):
+            os.remove(audio_path)
+        return False
     except subprocess.CalledProcessError as e:
         elapsed = time.time() - start
         logger.error(f"🎵 FFmpeg FAILED for {Path(video_path).name} ({elapsed:.1f}s): {e.stderr[:500]}")
@@ -402,25 +410,69 @@ def generate_srt(segments, srt_path, logger):
     return True
 
 # ============================================================
-# WHISPER TRANSCRIPTION
+# WHISPER TRANSCRIPTION (faster-whisper + Silero VAD)
 # ============================================================
 def transcribe_audio(audio_path, model, logger):
-    """Transcribe audio file using Whisper. Returns structured result."""
+    """
+    Transcribe audio file using faster-whisper with Silero VAD.
+    
+    Key improvements over vanilla whisper:
+    - Silero VAD: Filters silent parts → eliminates hallucination
+    - CTranslate2 backend: ~4x faster on GPU
+    - beam_size=5: Better search for optimal transcription
+    - condition_on_previous_text=True: Safe with VAD, improves coherence
+    - initial_prompt: Guides model for Vietnamese content
+    
+    Returns structured result compatible with existing pipeline.
+    """
     logger.info(f"🧠 Transcribing: {Path(audio_path).name}")
     start = time.time()
     
-    result = model.transcribe(
+    segments_iter, info = model.transcribe(
         audio_path,
         language="vi",
         task="transcribe",
-        verbose=False,
-        word_timestamps=False,
-        fp16=True,
+        beam_size=5,                           # Better search (default=5 in faster-whisper)
+        best_of=5,                             # Sample multiple candidates
+        patience=1.0,                          # Beam search patience
+        condition_on_previous_text=True,       # Safe with VAD → better coherence
+        compression_ratio_threshold=2.4,       # Filter repetitive/hallucinated segments
+        no_speech_threshold=0.6,               # Skip silent parts
+        log_prob_threshold=-1.0,               # Default log probability threshold
+        initial_prompt="Đây là bài giảng tiếng Việt.",  # Guide model for Vietnamese
+        
+        # ===== Silero VAD - KEY for accuracy =====
+        vad_filter=True,                       # Enable Voice Activity Detection
+        vad_parameters=dict(
+            threshold=0.5,                     # Speech detection sensitivity (0-1)
+            min_speech_duration_ms=250,         # Min speech segment (ms)
+            max_speech_duration_s=float('inf'), # No max limit on speech duration
+            min_silence_duration_ms=2000,       # Min silence to split segments (2s, good for lectures)
+            speech_pad_ms=400,                  # Padding around speech segments (ms)
+        ),
     )
     
+    # Materialize segments (faster-whisper returns a generator)
+    segments_list = []
+    for seg in segments_iter:
+        segments_list.append({
+            "start": seg.start,
+            "end": seg.end,
+            "text": seg.text,
+        })
+    
     elapsed = time.time() - start
-    num_segments = len(result.get("segments", []))
-    logger.info(f"🧠 Transcription done: {num_segments} segments in {elapsed:.1f}s")
+    logger.info(f"🧠 Transcription done: {len(segments_list)} segments in {elapsed:.1f}s")
+    logger.info(f"🧠 Detected language: {info.language} (prob={info.language_probability:.2f}), duration={info.duration:.1f}s")
+    
+    # Build result dict compatible with existing pipeline
+    full_text = " ".join(seg["text"].strip() for seg in segments_list)
+    result = {
+        "text": full_text,
+        "language": info.language,
+        "duration": info.duration,
+        "segments": segments_list,
+    }
     
     return result, elapsed
 
@@ -478,7 +530,7 @@ def format_result_json(video_name, drive_path, whisper_result, processing_time):
             "text": seg["text"].strip(),
         })
     
-    duration = segments[-1]["end"] if segments else 0
+    duration = whisper_result.get("duration", segments[-1]["end"] if segments else 0)
     
     return {
         "video_name": normalize_video_name(video_name),
@@ -744,11 +796,17 @@ Examples:
         pending_videos = pending_videos[:args.batch_size]
         logger.info(f"📦 BATCH MODE: Processing {len(pending_videos)} videos")
     
-    # ===== STEP 4: Load Whisper Model =====
-    logger.info(f"🧠 Loading Whisper model: {args.model}")
-    import whisper
-    model = whisper.load_model(args.model)
-    logger.info(f"🧠 Model loaded successfully!")
+    # ===== STEP 4: Load Whisper Model (faster-whisper) =====
+    logger.info(f"🧠 Loading faster-whisper model: {args.model}")
+    from faster_whisper import WhisperModel
+    
+    # Use float16 on GPU for speed, int8 on CPU for memory efficiency
+    model = WhisperModel(
+        args.model,
+        device="cuda",          # Use GPU (change to "cpu" if no GPU)
+        compute_type="float16",  # float16 for GPU, int8 for CPU
+    )
+    logger.info(f"🧠 faster-whisper model loaded successfully! (device=cuda, compute_type=float16)")
     
     # ===== STEP 5: Pipeline Processing =====
     prefetcher = Prefetcher(args.drive_input, logger)
@@ -771,9 +829,19 @@ Examples:
         else:
             next_video = None
         
-        # Wait for current video's prefetch to complete
+        # Wait for current video's prefetch to complete (max 20 min)
         logger.info(f"\n[{idx+1}/{total}] Waiting for download + audio extraction...")
-        _, audio_path, fetched_info = prefetcher.get_result()
+        try:
+            _, audio_path, fetched_info = prefetcher.get_result(timeout=1200)
+        except Exception:
+            logger.error(f"[{idx+1}/{total}] TIMEOUT waiting for prefetch: {video_info['Path']}")
+            checkpoint.mark_failed(video_info["Path"], "Prefetch timeout (>20min)")
+            fail_count += 1
+            # Kill stuck prefetcher and start fresh for next video
+            if next_video:
+                prefetcher = Prefetcher(args.drive_input, logger)
+                prefetcher.start_prefetch(next_video)
+            continue
         
         # Start prefetching next video immediately (pipeline!)
         if next_video:
