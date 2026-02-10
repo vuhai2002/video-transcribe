@@ -26,8 +26,11 @@ import subprocess
 import logging
 import threading
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from queue import Queue
+
+# Vietnam timezone (UTC+7)
+VN_TZ = timezone(timedelta(hours=7))
 
 # ============================================================
 # CONFIGURATION
@@ -48,7 +51,7 @@ def setup_logging():
     log_dir = os.path.join(LOCAL_WORK_DIR, "logs")
     os.makedirs(log_dir, exist_ok=True)
     
-    log_file = os.path.join(log_dir, f"transcribe_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+    log_file = os.path.join(log_dir, f"transcribe_{datetime.now(VN_TZ).strftime('%Y%m%d_%H%M%S')}.log")
     
     # Create formatter
     formatter = logging.Formatter(
@@ -237,7 +240,7 @@ class CheckpointManager:
     def save(self):
         """Save checkpoint to both local and Google Drive."""
         with self._lock:
-            self.data["stats"]["last_updated"] = datetime.now().isoformat()
+            self.data["stats"]["last_updated"] = datetime.now(VN_TZ).isoformat()
             
             # Save locally first
             with open(self.local_checkpoint_path, 'w', encoding='utf-8') as f:
@@ -260,7 +263,7 @@ class CheckpointManager:
         with self._lock:
             self.data["videos"][video_path] = {
                 "status": "processing",
-                "started_at": datetime.now().isoformat(),
+                "started_at": datetime.now(VN_TZ).isoformat(),
                 "completed_at": None
             }
         self.save()
@@ -272,7 +275,7 @@ class CheckpointManager:
             self.data["videos"][video_path] = {
                 "status": "done",
                 "started_at": self.data["videos"].get(video_path, {}).get("started_at"),
-                "completed_at": datetime.now().isoformat(),
+                "completed_at": datetime.now(VN_TZ).isoformat(),
                 "processing_time_seconds": round(processing_time, 1),
                 "output_json": output_json,
                 "output_srt": output_srt,
@@ -290,7 +293,7 @@ class CheckpointManager:
             self.data["videos"][video_path] = {
                 "status": "failed",
                 "started_at": self.data["videos"].get(video_path, {}).get("started_at"),
-                "completed_at": datetime.now().isoformat(),
+                "completed_at": datetime.now(VN_TZ).isoformat(),
                 "error": str(error_message)
             }
             self.data["stats"]["total_failed"] = sum(
@@ -484,7 +487,7 @@ def format_result_json(video_name, drive_path, whisper_result, processing_time):
         "full_text": whisper_result.get("text", "").strip(),
         "duration": round(duration, 2),
         "language": whisper_result.get("language", "vi"),
-        "transcribed_at": datetime.now().isoformat(),
+        "transcribed_at": datetime.now(VN_TZ).isoformat(),
         "model_used": DEFAULT_WHISPER_MODEL,
         "total_segments": len(segments),
         "processing_time_seconds": round(processing_time, 1),
