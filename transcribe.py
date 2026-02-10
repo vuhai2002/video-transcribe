@@ -422,6 +422,47 @@ def transcribe_audio(audio_path, model, logger):
     return result, elapsed
 
 
+import re
+
+def normalize_video_name(filename):
+    """
+    Normalize video filename to clean title case, preserving Vietnamese diacritics.
+    
+    Rules:
+    - Trim whitespace
+    - Replace underscores with spaces (except between digits: 20_05_2024)
+    - Collapse multiple spaces
+    - Normalize hyphens as separators: " - "
+    - Preserve parentheses, commas, dots
+    - Apply title case
+    
+    Examples:
+        'ai là chủ nhân.mp4'                       → 'Ai Là Chủ Nhân.mp4'
+        'kinh nikaya 15 - kinh sa môn quả (trường bộ).mp4'
+                                                    → 'Kinh Nikaya 15 - Kinh Sa Môn Quả (Trường Bộ).mp4'
+        'su phu noi chuyen - dai le phat dan - 20_05_2024.mp4'
+                                                    → 'Sư Phụ Nói Chuyện - Đại Lễ Phật Đản - 20_05_2024.mp4'
+        'luan ve nhan qua 06 - giong doc huong duong.mp4'
+                                                    → 'Luận Về Nhân Quả 06 - Giọng Đọc Hướng Dương.mp4'
+    """
+    stem = Path(filename).stem
+    ext = Path(filename).suffix.lower()
+    
+    # Replace underscores with spaces, EXCEPT between digits (dates: 20_05_2024)
+    name = re.sub(r'(?<!\d)_|_(?!\d)', ' ', stem)
+    
+    # Collapse multiple spaces and trim
+    name = re.sub(r'\s+', ' ', name).strip()
+    
+    # Normalize spaces around hyphens: "abc  -  def" → "abc - def"
+    name = re.sub(r'\s*-\s*', ' - ', name)
+    
+    # Apply title case
+    name = name.title()
+    
+    return f"{name}{ext}"
+
+
 def format_result_json(video_name, drive_path, whisper_result, processing_time):
     """Format Whisper result into structured JSON for database import."""
     segments = []
@@ -437,7 +478,8 @@ def format_result_json(video_name, drive_path, whisper_result, processing_time):
     duration = segments[-1]["end"] if segments else 0
     
     return {
-        "video_name": video_name,
+        "video_name": normalize_video_name(video_name),
+        "video_name_original": video_name,
         "drive_path": drive_path,
         "full_text": whisper_result.get("text", "").strip(),
         "duration": round(duration, 2),
