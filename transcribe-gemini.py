@@ -129,7 +129,7 @@ def call_gemini_api(local_audio_path, model_name, logger):
         if remote_file.state.name == "FAILED":
             raise ValueError("Gemini File Processing FAILED.")
         
-        logger.info(f"   ✨ [Gemini] Ready. Generating SRT...")
+        logger.info(f"   ✨ [Gemini] Ready. Generating SRT: {file_name}")
             
         # 3. Setup Model & Safety
         model = genai.GenerativeModel(model_name)
@@ -180,7 +180,7 @@ def call_gemini_api(local_audio_path, model_name, logger):
                         return None
                     
                     # If it's empty response
-                    logger.warning(f"   ⚠️  [Attempt {attempt+1}] Finish Reason: {reason_str}. Content empty.")
+                    logger.warning(f"   ⚠️  [{file_name}] [Attempt {attempt+1}] Finish Reason: {reason_str}. Content empty.")
                     if attempt < max_retries - 1:
                         time.sleep(5)
                         continue
@@ -196,10 +196,10 @@ def call_gemini_api(local_audio_path, model_name, logger):
                 return text_result.strip()
 
             except exceptions.InternalServerError:
-                logger.warning(f"   🔥 [Attempt {attempt+1}] Server Error (500). Retrying...")
+                logger.warning(f"   🔥 [{file_name}] [Attempt {attempt+1}] Server Error (500). Retrying...")
                 time.sleep(10)
             except exceptions.ServiceUnavailable:
-                logger.warning(f"   🔥 [Attempt {attempt+1}] Service Unavailable (503). Retrying...")
+                logger.warning(f"   🔥 [{file_name}] [Attempt {attempt+1}] Service Unavailable (503). Retrying...")
                 time.sleep(10)
             except ValueError as ve:
                 # Catch "response.text quick accessor" error here
