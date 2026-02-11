@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Gemini Audio Transcription Pipeline
-===================================
+Gemini Audio Transcription Pipeline (Robust Error Handling)
+=========================================================
 Quy trình:
 1. Quét file MP3 trên Google Drive (qua Rclone).
 2. Worker (đa luồng) tải file về VM.
@@ -13,6 +13,11 @@ Quy trình:
 Usage:
     export GOOGLE_API_KEY="AIzaSy..."
     python3 transcribe-gemini.py --drive-input "Output/Audio" --drive-output "Output" --workers 3
+
+Cải tiến:
+- Tự động Retry khi gặp lỗi 500 (Internal Server Error).
+- Bắt lỗi Finish Reason (Safety/Copyright) rõ ràng.
+- Xử lý mượt mà response rỗng.
 """
 
 import os
@@ -29,10 +34,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Thư viện Google
 import google.generativeai as genai
-from google.api_core import retry
+from google.api_core import exceptions
 
-# --- CẤU HÌNH MẶC ĐỊNH ---
-# Nên dùng gemini-3-pro-preview
+# --- CẤU HÌNH ---
 DEFAULT_MODEL = "gemini-3-pro-preview" 
 RCLONE_REMOTE = "gdrive"
 LOCAL_WORK_DIR = os.path.expanduser("~/gemini-work")
@@ -64,7 +68,7 @@ def setup_logging():
     return logger
 
 # ============================================================
-# RCLONE UTILS (Giữ nguyên logic ổn định từ file cũ)
+# RCLONE UTILS
 # ============================================================
 def rclone_run(cmd_args, logger):
     cmd = ["rclone"] + cmd_args
@@ -95,7 +99,6 @@ def get_remote_files(remote_path, logger):
         return []
 
 def check_exists_on_drive(remote_srt_path, logger):
-    """Kiểm tra xem file SRT đã tồn tại trên Drive chưa"""
     cmd = ["lsjson", f"{RCLONE_REMOTE}:{remote_srt_path}"]
     result = subprocess.run(["rclone"] + cmd, capture_output=True, text=True)
     if result.returncode == 0 and result.stdout.strip() != "":
@@ -110,9 +113,6 @@ def check_exists_on_drive(remote_srt_path, logger):
 # GEMINI CORE LOGIC
 # ============================================================
 def call_gemini_api(local_audio_path, model_name, logger):
-    """
-    Core logic: Upload -> Wait -> Generate -> Delete Remote
-    """
     file_name = os.path.basename(local_audio_path)
     remote_file = None
     
@@ -128,18 +128,20 @@ def call_gemini_api(local_audio_path, model_name, logger):
             
         if remote_file.state.name == "FAILED":
             raise ValueError("Gemini File Processing FAILED.")
-            
+        
         logger.info(f"   ✨ [Gemini] Ready. Generating SRT...")
-
-        # 3. Generate Content
+            
+        # 3. Setup Model & Safety
         model = genai.GenerativeModel(model_name)
         
-        # Prompt kỹ thuật (giữ nguyên logic test.py)
         prompt = """
-        Nghe file âm thanh này và tạo phụ đề chính xác từng từ (verbatim).
+        Nghe file âm thanh đính kèm và tạo phụ đề chính xác từng từ (verbatim).
+        **Yêu cầu kỹ thuật:**
+        1. **Độ chính xác:** Timestamp phải khớp chính xác với âm thanh.
+        3. **Trình bày:** Ngắt dòng tự nhiên theo ngữ điệu. Tối đa 40 ký tự trên một dòng để đảm bảo hiển thị tốt trên mọi màn hình.
+        4. **Nội dung:** Tuyệt đối không tóm tắt, không bỏ sót từ nào.
         Output bắt buộc phải ở định dạng chuẩn SRT (SubRip).
         Không bao gồm bất kỳ lời dẫn hay markdown code block nào (như ```srt), chỉ trả về plain text của nội dung SRT.
-        Kiểm tra kỹ timeline, đảm bảo không bị chồng chéo.
         """
         
         # Safety settings: Tắt filter để tránh chặn nội dung tôn giáo/triết học
@@ -150,34 +152,74 @@ def call_gemini_api(local_audio_path, model_name, logger):
             {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
         ]
 
-        # Retry policy cho API call
-        response = model.generate_content(
-            [remote_file, prompt],
-            request_options={"timeout": 1200}, # Tăng timeout cho file dài
-            safety_settings=safety_settings
-        )
-        
-        text_result = response.text
-        
-        # 4. Clean formatting (FIXED REGEX HERE)
-        # Xóa ```srt ở đầu
-        text_result = re.sub(r'^```srt\s*', '', text_result, flags=re.IGNORECASE)
-        # Xóa ``` ở đầu
-        text_result = re.sub(r'^```\s*', '', text_result)
-        # Xóa ``` ở cuối
-        text_result = re.sub(r'```\s*$', '', text_result)
-        
-        return text_result.strip()
+        # 4. Generate with Retry Loop (Manual Retry for 500 errors)
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = model.generate_content(
+                    [remote_file, prompt],
+                    request_options={"timeout": 1200},
+                    safety_settings=safety_settings
+                )
+                
+                # Check explicitly for finish reason before accessing .text
+                candidate = response.candidates[0]
+                if candidate.finish_reason != 1: # 1 = STOP (Success)
+                    reason_map = {
+                        2: "MAX_TOKENS (Too long) or SAFETY", # Sometimes API maps safety here
+                        3: "SAFETY",
+                        4: "RECITATION (Copyright)",
+                        5: "OTHER"
+                    }
+                    reason_str = reason_map.get(candidate.finish_reason, f"Code {candidate.finish_reason}")
+                    
+                    # If it's a safety block, retrying rarely helps, but we log it well.
+                    # If it's Copyright (4), we must stop.
+                    if candidate.finish_reason == 4:
+                        logger.error(f"   ⛔ [Copyright Blocked] {file_name}: Google detected copyrighted content.")
+                        return None
+                    
+                    # If it's empty response
+                    logger.warning(f"   ⚠️  [Attempt {attempt+1}] Finish Reason: {reason_str}. Content empty.")
+                    if attempt < max_retries - 1:
+                        time.sleep(5)
+                        continue
+                    return None
+
+                text_result = response.text
+                
+                # Clean formatting
+                text_result = re.sub(r'^```srt\s*', '', text_result, flags=re.IGNORECASE)
+                text_result = re.sub(r'^```\s*', '', text_result)
+                text_result = re.sub(r'```\s*$', '', text_result)
+                
+                return text_result.strip()
+
+            except exceptions.InternalServerError:
+                logger.warning(f"   🔥 [Attempt {attempt+1}] Server Error (500). Retrying...")
+                time.sleep(10)
+            except exceptions.ServiceUnavailable:
+                logger.warning(f"   🔥 [Attempt {attempt+1}] Service Unavailable (503). Retrying...")
+                time.sleep(10)
+            except ValueError as ve:
+                # Catch "response.text quick accessor" error here
+                logger.error(f"   ❌ [Value Error] {file_name}: {ve} (Likely blocked)")
+                return None
+            except Exception as e:
+                logger.error(f"   ❌ [Unknown Error] {file_name}: {e}")
+                return None
+
+        return None
 
     except Exception as e:
-        logger.error(f"   ❌ [Gemini Error] {file_name}: {e}")
+        logger.error(f"   ❌ [Upload/Setup Error] {file_name}: {e}")
         return None
     finally:
-        # 5. Dọn dẹp file trên cloud (quan trọng để không đầy quota)
+        # 5. Dọn dẹp file trên cloud
         if remote_file:
             try:
                 genai.delete_file(remote_file.name)
-                # logger.debug(f"   🗑️  [Gemini] Deleted cloud file: {remote_file.name}")
+                logger.debug(f"   🗑️  [Gemini] Deleted cloud file: {remote_file.name}")
             except:
                 pass
 
@@ -185,20 +227,15 @@ def call_gemini_api(local_audio_path, model_name, logger):
 # WORKER PIPELINE
 # ============================================================
 def process_single_file(file_info, drive_input, drive_output, model_name, logger):
-    """
-    Quy trình xử lý 1 file: Tải -> Gemini -> Lưu SRT -> Upload -> Xóa
-    """
     rel_path = file_info["Path"]
     file_name = os.path.basename(rel_path)
     base_name = os.path.splitext(file_name)[0]
     
-    # Đường dẫn cục bộ
     local_audio = os.path.join(LOCAL_WORK_DIR, "downloads", file_name)
     local_srt = os.path.join(LOCAL_WORK_DIR, "output", f"{base_name}.srt")
     
-    # Đường dẫn remote output
-    remote_srt_rel = os.path.join("SRT", os.path.dirname(rel_path), f"{base_name}.srt")
-    remote_srt_full = f"{drive_output}/{remote_srt_rel}".replace("\\", "/") # Rclone dùng forward slash
+    remote_srt_rel = os.path.join(os.path.dirname(rel_path), f"{base_name}.srt")
+    remote_srt_full = f"{drive_output}/{remote_srt_rel}".replace("\\", "/") 
 
     try:
         # Check if output exists
@@ -206,7 +243,7 @@ def process_single_file(file_info, drive_input, drive_output, model_name, logger
             logger.info(f"⏭️  Skipping (Exists): {base_name}.srt")
             return "SKIPPED"
 
-        logger.info(f"🎬 Start: {file_name}")
+        logger.info(f"🎬 Processing: {file_name}")
         
         # 1. Download
         os.makedirs(os.path.dirname(local_audio), exist_ok=True)
@@ -217,6 +254,8 @@ def process_single_file(file_info, drive_input, drive_output, model_name, logger
         srt_content = call_gemini_api(local_audio, model_name, logger)
         
         if not srt_content:
+            # Nếu thất bại, xóa file audio local để tránh rác
+            if os.path.exists(local_audio): os.remove(local_audio)
             return "GEMINI_FAILED"
             
         # 3. Save Local SRT
@@ -236,7 +275,7 @@ def process_single_file(file_info, drive_input, drive_output, model_name, logger
         return "ERROR"
         
     finally:
-        # 5. Cleanup Local Files (Giải phóng ổ cứng VM)
+        # Cleanup
         if os.path.exists(local_audio): os.remove(local_audio)
         if os.path.exists(local_srt): os.remove(local_srt)
 
@@ -245,11 +284,11 @@ def process_single_file(file_info, drive_input, drive_output, model_name, logger
 # ============================================================
 def main():
     parser = argparse.ArgumentParser(description="Gemini Transcription Worker")
-    parser.add_argument("--drive-input", required=True, help="Folder Audio trên Drive (e.g. Output/Audio)")
-    parser.add_argument("--drive-output", required=True, help="Folder Output gốc trên Drive (e.g. Output)")
-    parser.add_argument("--api-key", help="Gemini API Key (hoặc set env GOOGLE_API_KEY)")
-    parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Model name (default: {DEFAULT_MODEL})")
-    parser.add_argument("--workers", type=int, default=3, help="Số luồng chạy song song (Default: 3)")
+    parser.add_argument("--drive-input", required=True, help="Folder Audio trên Drive")
+    parser.add_argument("--drive-output", required=True, help="Folder Output gốc trên Drive")
+    parser.add_argument("--api-key", help="Gemini API Key")
+    parser.add_argument("--model", default=DEFAULT_MODEL, help="Model name")
+    parser.add_argument("--workers", type=int, default=3, help="Số luồng chạy song song")
     
     args = parser.parse_args()
     
@@ -263,10 +302,9 @@ def main():
     
     logger = setup_logging()
     logger.info("="*50)
-    logger.info(f"🚀 GEMINI TRANSCRIPTION STARTED")
+    logger.info(f"🚀 GEMINI TRANSCRIPTION (ROBUST MODE)")
     logger.info(f"   Model:   {args.model}")
     logger.info(f"   Workers: {args.workers}")
-    logger.info(f"   Input:   {args.drive_input}")
     logger.info("="*50)
 
     # 1. List Files
