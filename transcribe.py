@@ -1,26 +1,33 @@
 #!/usr/bin/env python3
 """
-Video Transcription Pipeline (Spot Instance Safe)
+Audio Transcription Pipeline (Spot Instance Safe)
 ===================================================
-Tự động tải video từ Google Drive, tách audio, transcribe bằng faster-whisper
-(với Silero VAD), upload kết quả (JSON, SRT, MP3) lên Drive, và dọn dẹp.
+Tải MP3 từ Google Drive, transcribe bằng faster-whisper (với Silero VAD),
+upload kết quả (JSON, SRT) lên Drive, và dọn dẹp.
+
+Quy trình: [transcribe.py]    MP3 → Transcribe → JSON/SRT → Drive
 
 Tính năng:
+- Input: Folder MP3 trên Google Drive (đã được convert từ convert_audio.py)
 - faster-whisper + Silero VAD: Transcription chính xác, chống hallucination
-- Pipeline gối đầu: Tải Video B trong khi Transcribe Video A
+- Anti-hallucination: condition_on_previous_text=False, strict thresholds, post-processing filter
+- Post-processing: Tự động phát hiện & loại bỏ segments lặp/hallucinate
+- Pipeline gối đầu: Tải MP3 B trong khi Transcribe MP3 A
 - Checkpoint trên Google Drive: An toàn khi Spot Instance bị thu hồi
-- Auto-resume: Tự động tiếp tục từ video cuối cùng khi VM khởi động lại
+- Auto-resume: Tự động tiếp tục từ file cuối cùng khi VM khởi động lại
 - Log chi tiết: Ghi lại mọi bước xử lý
+- Xóa sạch file trên VM sau khi xử lý xong
 
 Usage:
-    python3 transcribe.py --drive-input "Folder/Video" --drive-output "Output"
-    python3 transcribe.py --drive-input "Folder/Video" --drive-output "Output" --test
-    python3 transcribe.py --drive-input "Folder/Video" --drive-output "Output" --model medium
+    python3 transcribe.py --drive-input "Output/Audio" --drive-output "Output"
+    python3 transcribe.py --drive-input "Output/Audio" --drive-output "Output" --test
+    python3 transcribe.py --drive-input "Output/Audio" --drive-output "Output" --model medium
 """
 
 import os
 import sys
 import json
+import re
 import time
 import argparse
 import subprocess
@@ -41,8 +48,8 @@ RCLONE_REMOTE = "gdrive"
 LOCAL_WORK_DIR = os.path.expanduser("~/transcribe-work")
 CHECKPOINT_FILENAME = "checkpoint.json"
 
-# Supported video formats
-VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv"}
+# Supported audio formats (input)
+AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".flac", ".ogg", ".aac", ".wma"}
 
 # ============================================================
 # LOGGING SETUP
@@ -100,8 +107,8 @@ def rclone_run(args, desc="rclone", logger=None):
 
 def rclone_list_files(remote_path, logger):
     """
-    List all video files in a remote path using rclone lsjson.
-    Returns list of dicts: [{"Path": "sub/video.mp4", "Size": 123456, "Name": "video.mp4"}, ...]
+    List all audio files in a remote path using rclone lsjson.
+    Returns list of dicts: [{"Path": "audio.mp3", "Size": 123456, "Name": "audio.mp3"}, ...]
     """
     logger.info(f"Scanning remote path: {RCLONE_REMOTE}:{remote_path}")
     
@@ -121,23 +128,23 @@ def rclone_list_files(remote_path, logger):
         logger.error(f"Failed to parse rclone output: {e}")
         return []
     
-    # Filter video files only
-    video_files = [
+    # Filter audio files only
+    audio_files = [
         f for f in all_files
-        if Path(f["Path"]).suffix.lower() in VIDEO_EXTENSIONS
+        if Path(f["Path"]).suffix.lower() in AUDIO_EXTENSIONS
     ]
     
     # Sort A-Z by path
-    video_files.sort(key=lambda f: f["Path"])
+    audio_files.sort(key=lambda f: f["Path"])
     
-    logger.info(f"Found {len(video_files)} video files (sorted A-Z)")
-    for i, f in enumerate(video_files[:5]):
+    logger.info(f"Found {len(audio_files)} audio files (sorted A-Z)")
+    for i, f in enumerate(audio_files[:5]):
         size_mb = f.get("Size", 0) / (1024 * 1024)
         logger.debug(f"  [{i+1}] {f['Path']} ({size_mb:.1f} MB)")
-    if len(video_files) > 5:
-        logger.debug(f"  ... and {len(video_files) - 5} more")
+    if len(audio_files) > 5:
+        logger.debug(f"  ... and {len(audio_files) - 5} more")
     
-    return video_files
+    return audio_files
 
 
 def rclone_download(remote_path, local_path, logger):
@@ -191,15 +198,14 @@ class CheckpointManager:
     
     Checkpoint format:
     {
-        "videos": {
-            "path/to/video.mp4": {
-                "status": "done" | "processing",
+        "audios": {
+            "path/to/audio.mp3": {
+                "status": "done" | "processing" | "failed",
                 "started_at": "2026-02-10T10:00:00",
                 "completed_at": "2026-02-10T10:15:00",
                 "processing_time_seconds": 900.0,
-                "output_json": "Output/JSON/video.json",
-                "output_srt": "Output/SRT/video.srt",
-                "output_mp3": "Output/Audio/video.mp3"
+                "output_json": "Output/JSON/audio.json",
+                "output_srt": "Output/SRT/audio.srt"
             }
         },
         "stats": {
@@ -214,7 +220,7 @@ class CheckpointManager:
         self.logger = logger
         self.drive_checkpoint_path = f"{drive_output_path}/{CHECKPOINT_FILENAME}"
         self.local_checkpoint_path = os.path.join(LOCAL_WORK_DIR, CHECKPOINT_FILENAME)
-        self.data = {"videos": {}, "stats": {"total_processed": 0, "total_failed": 0}}
+        self.data = {"audios": {}, "stats": {"total_processed": 0, "total_failed": 0}}
         self._lock = threading.Lock()
     
     def load(self):
@@ -231,10 +237,14 @@ class CheckpointManager:
             try:
                 with open(self.local_checkpoint_path, 'r', encoding='utf-8') as f:
                     self.data = json.load(f)
-                self.logger.info(f"Checkpoint loaded: {len(self.data.get('videos', {}))} videos tracked")
+                # Support both old "videos" key and new "audios" key
+                if "videos" in self.data and "audios" not in self.data:
+                    self.data["audios"] = self.data.pop("videos")
+                tracked = len(self.data.get('audios', {}))
+                self.logger.info(f"Checkpoint loaded: {tracked} files tracked")
             except (json.JSONDecodeError, KeyError) as e:
                 self.logger.warning(f"Checkpoint corrupt, starting fresh: {e}")
-                self.data = {"videos": {}, "stats": {"total_processed": 0, "total_failed": 0}}
+                self.data = {"audios": {}, "stats": {"total_processed": 0, "total_failed": 0}}
         else:
             self.logger.info("No existing checkpoint found, starting fresh")
     
@@ -259,67 +269,66 @@ class CheckpointManager:
             else:
                 self.logger.warning("Failed to save checkpoint to Drive (will retry next time)")
     
-    def mark_processing(self, video_path):
-        """Mark a video as currently being processed."""
+    def mark_processing(self, audio_path):
+        """Mark an audio file as currently being processed."""
         with self._lock:
-            self.data["videos"][video_path] = {
+            self.data["audios"][audio_path] = {
                 "status": "processing",
                 "started_at": datetime.now(VN_TZ).isoformat(),
                 "completed_at": None
             }
         self.save()
-        self.logger.info(f"📝 Checkpoint: PROCESSING → {video_path}")
+        self.logger.info(f"📝 Checkpoint: PROCESSING → {audio_path}")
     
-    def mark_done(self, video_path, processing_time, output_json, output_srt, output_mp3):
-        """Mark a video as successfully processed."""
+    def mark_done(self, audio_path, processing_time, output_json, output_srt):
+        """Mark an audio file as successfully processed."""
         with self._lock:
-            self.data["videos"][video_path] = {
+            self.data["audios"][audio_path] = {
                 "status": "done",
-                "started_at": self.data["videos"].get(video_path, {}).get("started_at"),
+                "started_at": self.data["audios"].get(audio_path, {}).get("started_at"),
                 "completed_at": datetime.now(VN_TZ).isoformat(),
                 "processing_time_seconds": round(processing_time, 1),
                 "output_json": output_json,
-                "output_srt": output_srt,
-                "output_mp3": output_mp3
+                "output_srt": output_srt
             }
             self.data["stats"]["total_processed"] = sum(
-                1 for v in self.data["videos"].values() if v["status"] == "done"
+                1 for v in self.data["audios"].values() if v["status"] == "done"
             )
         self.save()
-        self.logger.info(f"✅ Checkpoint: DONE → {video_path} ({processing_time:.1f}s)")
+        self.logger.info(f"✅ Checkpoint: DONE → {audio_path} ({processing_time:.1f}s)")
     
-    def mark_failed(self, video_path, error_message):
-        """Mark a video as failed."""
+    def mark_failed(self, audio_path, error_message):
+        """Mark an audio file as failed."""
         with self._lock:
-            self.data["videos"][video_path] = {
+            self.data["audios"][audio_path] = {
                 "status": "failed",
-                "started_at": self.data["videos"].get(video_path, {}).get("started_at"),
+                "started_at": self.data["audios"].get(audio_path, {}).get("started_at"),
                 "completed_at": datetime.now(VN_TZ).isoformat(),
                 "error": str(error_message)
             }
             self.data["stats"]["total_failed"] = sum(
-                1 for v in self.data["videos"].values() if v["status"] == "failed"
+                1 for v in self.data["audios"].values() if v["status"] == "failed"
             )
         self.save()
-        self.logger.error(f"❌ Checkpoint: FAILED → {video_path}: {error_message}")
+        self.logger.error(f"❌ Checkpoint: FAILED → {audio_path}: {error_message}")
     
-    def get_status(self, video_path):
-        """Get status of a video: 'done', 'processing', 'failed', or None."""
-        return self.data.get("videos", {}).get(video_path, {}).get("status")
+    def get_status(self, audio_path):
+        """Get status of an audio file: 'done', 'processing', 'failed', or None."""
+        return self.data.get("audios", {}).get(audio_path, {}).get("status")
     
-    def get_pending_videos(self, all_videos):
+    def get_pending_audios(self, all_audios):
         """
-        Filter videos that need processing.
-        - Skip 'done' videos
-        - Re-process 'processing' videos (crashed mid-way)
-        - Re-process 'failed' videos (might succeed this time)
+        Filter audio files that need processing.
+        - Skip 'done' audios
+        - Re-process 'processing' audios (crashed mid-way)
+        - Re-process 'failed' audios (might succeed this time)
         """
         pending = []
         skipped = 0
         retry = 0
         
-        for video in all_videos:
-            path = video["Path"]
+        for audio in all_audios:
+            path = audio["Path"]
             status = self.get_status(path)
             
             if status == "done":
@@ -327,56 +336,16 @@ class CheckpointManager:
             elif status == "processing":
                 self.logger.warning(f"🔄 Re-processing (crashed mid-way): {path}")
                 retry += 1
-                pending.append(video)
+                pending.append(audio)
             elif status == "failed":
                 self.logger.warning(f"🔄 Retrying (previously failed): {path}")
                 retry += 1
-                pending.append(video)
+                pending.append(audio)
             else:
-                pending.append(video)
+                pending.append(audio)
         
-        self.logger.info(f"Videos: {len(all_videos)} total | {skipped} done | {retry} retry | {len(pending)} pending")
+        self.logger.info(f"Audios: {len(all_audios)} total | {skipped} done | {retry} retry | {len(pending)} pending")
         return pending
-
-# ============================================================
-# AUDIO EXTRACTION (MP4 → MP3)
-# ============================================================
-def extract_audio(video_path, audio_path, logger):
-    """Extract audio from video file to MP3 format."""
-    os.makedirs(os.path.dirname(audio_path), exist_ok=True)
-    
-    logger.info(f"🎵 Extracting audio: {Path(video_path).name} → {Path(audio_path).name}")
-    start = time.time()
-    
-    cmd = [
-        "ffmpeg",
-        "-i", video_path,
-        "-vn",                    # No video
-        "-acodec", "libmp3lame",  # MP3 codec
-        "-ab", "128k",            # 128kbps (good for speech)
-        "-ar", "16000",           # 16kHz (Whisper optimal)
-        "-ac", "1",               # Mono
-        "-y",                     # Overwrite
-        audio_path
-    ]
-    
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=600)
-        elapsed = time.time() - start
-        size_mb = os.path.getsize(audio_path) / (1024 * 1024)
-        logger.info(f"🎵 Audio extracted: {Path(audio_path).name} ({size_mb:.1f} MB in {elapsed:.1f}s)")
-        return True
-    except subprocess.TimeoutExpired:
-        elapsed = time.time() - start
-        logger.error(f"🎵 FFmpeg TIMEOUT (>10min) for {Path(video_path).name} ({elapsed:.1f}s)")
-        # Clean up partial audio file
-        if os.path.exists(audio_path):
-            os.remove(audio_path)
-        return False
-    except subprocess.CalledProcessError as e:
-        elapsed = time.time() - start
-        logger.error(f"🎵 FFmpeg FAILED for {Path(video_path).name} ({elapsed:.1f}s): {e.stderr[:500]}")
-        return False
 
 # ============================================================
 # SRT GENERATION
@@ -410,62 +379,159 @@ def generate_srt(segments, srt_path, logger):
     return True
 
 # ============================================================
+# HALLUCINATION DETECTION & POST-PROCESSING
+# ============================================================
+def filter_hallucinated_segments(segments, duration, logger):
+    """
+    Post-processing filter:
+    1. Removes specific hallucinated phrases (YouTuber intros, subtitles credits).
+    2. Removes repetitive loops.
+    3. Removes abnormal duration segments.
+    """
+    if not segments:
+        return segments
+    
+    original_count = len(segments)
+    
+    # === 0. Blacklist Filter (Các từ khóa ảo giác thường gặp của Whisper) ===
+    # Whisper thường bị hallucinate ra các câu này khi gặp im lặng
+    BLACKLIST_PHRASES = [
+        "hãy subscribe", "kênh ghiền mì gõ", "đăng ký kênh", 
+        "subtitles by", "amara.org", "vietsub bởi", 
+        "chúc các bạn nghe nhạc", "bản quyền thuộc về",
+        "click vào nút đăng ký", "đừng quên like"
+    ]
+    
+    filtered_0 = []
+    for seg in segments:
+        text_lower = seg["text"].lower()
+        # Nếu segment chứa từ cấm
+        if any(bad in text_lower for bad in BLACKLIST_PHRASES):
+            logger.warning(f"  [Filter] Removed Blacklist Phrase: '{seg['text'][:50]}...'")
+            continue
+        # Nếu segment chỉ toàn dấu chấm, phẩy hoặc ký tự lạ
+        if not re.search(r'[a-zA-Zăâđêôơưàảãạáằẳẵặắầẩẫậấèẻẽẹéềểễệếìỉĩịíòỏõọóồổỗộốờởỡợớùủũụúừửữựứỳỷỹỵý]', text_lower):
+             logger.debug(f"  [Filter] Removed empty/symbol segment: '{seg['text']}'")
+             continue
+        filtered_0.append(seg)
+
+    # === 1. Consecutive Filter (Lọc câu lặp liên tiếp) ===
+    filtered_1 = []
+    if filtered_0:
+        filtered_1.append(filtered_0[0])
+        for i in range(1, len(filtered_0)):
+            current_text = filtered_0[i]["text"].strip()
+            prev_text = filtered_0[i-1]["text"].strip()
+            
+            # Tính tỷ lệ giống nhau (Levenshtein đơn giản hoặc check string)
+            # Nếu giống nhau > 90% thì bỏ
+            if current_text == prev_text:
+                logger.debug(f"  [Filter] Removed exact repeat: '{current_text[:30]}...'")
+                continue
+                
+            # Check lặp nội bộ: "A A A A A"
+            # Nếu 1 từ xuất hiện quá nhiều lần trong 1 câu ngắn
+            words = current_text.split()
+            if len(words) > 10:
+                unique_words = set(words)
+                if len(unique_words) < len(words) * 0.3: # Quá ít từ vựng đa dạng -> Lặp
+                     logger.debug(f"  [Filter] Removed internal loop: '{current_text[:30]}...'")
+                     continue
+
+            filtered_1.append(filtered_0[i])
+
+    # === 2. Duration/Text Ratio (Lọc segment dài nhưng ít chữ) ===
+    filtered_2 = []
+    for seg in filtered_1:
+        seg_duration = seg["end"] - seg["start"]
+        text_len = len(seg["text"].strip())
+        
+        # Segment dài > 15s mà dưới 10 ký tự -> Rác
+        if seg_duration > 15 and text_len < 10:
+             continue
+        
+        # Segment cực dài (>30s) mà text quá ngắn (<30 chars) -> Nhạc nền bị nhận nhầm
+        if seg_duration > 30 and text_len < 30:
+            logger.debug(f"  [Filter] Removed long silence hallucination: {seg_duration}s / '{seg['text'][:20]}'")
+            continue
+            
+        filtered_2.append(seg)
+    
+    total_removed = original_count - len(filtered_2)
+    if total_removed > 0:
+        logger.info(f"🧹 Post-processing: {original_count} → {len(filtered_2)} segments (removed {total_removed})")
+    
+    return filtered_2
+
+
+# ============================================================
 # WHISPER TRANSCRIPTION (faster-whisper + Silero VAD)
 # ============================================================
 def transcribe_audio(audio_path, model, logger):
     """
-    Transcribe audio file using faster-whisper with Silero VAD.
-    
-    Key improvements over vanilla whisper:
-    - Silero VAD: Filters silent parts → eliminates hallucination
-    - CTranslate2 backend: ~4x faster on GPU
-    - beam_size=5: Better search for optimal transcription
-    - condition_on_previous_text=True: Safe with VAD, improves coherence
-    - initial_prompt: Guides model for Vietnamese content
-    
-    Returns structured result compatible with existing pipeline.
+    Transcribe audio file using faster-whisper with Optimized VAD for Vietnamese.
     """
     logger.info(f"🧠 Transcribing: {Path(audio_path).name}")
     start = time.time()
     
+    # Prompt kỹ thuật: Hướng dẫn model không lặp, dùng tiếng Việt chuẩn
+    initial_prompt = "Đây là bài giảng Phật pháp, ngôn ngữ tiếng Việt rõ ràng, mạch lạc. Không lặp lại câu."
+
     segments_iter, info = model.transcribe(
         audio_path,
         language="vi",
         task="transcribe",
-        beam_size=5,                           # Better search (default=5 in faster-whisper)
-        best_of=5,                             # Sample multiple candidates
-        patience=1.0,                          # Beam search patience
-        condition_on_previous_text=True,       # Safe with VAD → better coherence
-        compression_ratio_threshold=2.4,       # Filter repetitive/hallucinated segments
-        no_speech_threshold=0.6,               # Skip silent parts
-        log_prob_threshold=-1.0,               # Default log probability threshold
-        initial_prompt="Đây là bài giảng tiếng Việt.",  # Guide model for Vietnamese
+        beam_size=5,
+        best_of=5,
         
-        # ===== Silero VAD - KEY for accuracy =====
-        vad_filter=True,                       # Enable Voice Activity Detection
+        # ===== ANTI-HALLUCINATION & SETTINGS =====
+        condition_on_previous_text=False,      # TUYỆT ĐỐI FALSE để tránh vòng lặp vô tận
+        temperature=[0.0, 0.2],                # Chỉ cho phép nhiệt độ thấp, nếu không chắc chắn thì bỏ qua luôn (tránh bịa ra text ở nhiệt độ cao)
+        compression_ratio_threshold=2.0,       # Chặt hơn (gốc 2.4). Nếu nén text lại mà ratio cao nghĩa là text bị lặp -> Bỏ.
+        log_prob_threshold=-1.0,               # Tăng độ tự tin cần thiết (gốc -1.0, có thể giữ nguyên hoặc giảm chút)
+        no_speech_threshold=0.6,               # Tăng lên 0.6: Phải xác suất là tiếng người > 60% mới lấy.
+        repetition_penalty=1.2,                # Phạt nặng việc lặp từ (gốc 1.0)
+        
+        initial_prompt=initial_prompt,
+        
+        # ===== SILERO VAD - QUAN TRỌNG NHẤT =====
+        vad_filter=True,
         vad_parameters=dict(
-            threshold=0.5,                     # Speech detection sensitivity (0-1)
-            min_speech_duration_ms=250,         # Min speech segment (ms)
-            max_speech_duration_s=float('inf'), # No max limit on speech duration
-            min_silence_duration_ms=2000,       # Min silence to split segments (2s, good for lectures)
-            speech_pad_ms=400,                  # Padding around speech segments (ms)
+            threshold=0.6,                     # Tăng lên 0.6: Chỉ lấy giọng nói thật rõ, bỏ nhạc nền/tiếng ồn.
+            min_speech_duration_ms=250,
+            max_speech_duration_s=20.0,        # QUAN TRỌNG: Cắt cứng mỗi 20s. Không để vô tận (inf) gây lỗi lặp 60s.
+            min_silence_duration_ms=1000,      # Giảm xuống để VAD cắt segment nhanh hơn khi ngắt nghỉ.
+            speech_pad_ms=400,
         ),
     )
     
-    # Materialize segments (faster-whisper returns a generator)
     segments_list = []
-    for seg in segments_iter:
-        segments_list.append({
-            "start": seg.start,
-            "end": seg.end,
-            "text": seg.text,
-        })
+    # Lưu ý: faster-whisper là generator, lỗi sẽ bắn ra khi loop
+    try:
+        for seg in segments_iter:
+            # Quick check: Nếu segment sinh ra text giống hệt segment ngay trước đó -> Bỏ qua luôn tại nguồn
+            if segments_list and seg.text.strip() == segments_list[-1]["text"].strip():
+                continue
+                
+            segments_list.append({
+                "start": seg.start,
+                "end": seg.end,
+                "text": seg.text,
+            })
+    except Exception as e:
+        logger.error(f"Error during transcription loop: {e}")
+        # Vẫn trả về những gì đã làm được
+        pass
+
+    elapsed_transcribe = time.time() - start
+    logger.info(f"🧠 Transcription done raw: {len(segments_list)} segments")
+    logger.info(f"🧠 Detected info: duration={info.duration:.1f}s")
+    
+    # ===== POST-PROCESSING =====
+    segments_list = filter_hallucinated_segments(segments_list, info.duration, logger)
     
     elapsed = time.time() - start
-    logger.info(f"🧠 Transcription done: {len(segments_list)} segments in {elapsed:.1f}s")
-    logger.info(f"🧠 Detected language: {info.language} (prob={info.language_probability:.2f}), duration={info.duration:.1f}s")
     
-    # Build result dict compatible with existing pipeline
     full_text = " ".join(seg["text"].strip() for seg in segments_list)
     result = {
         "text": full_text,
@@ -477,11 +543,9 @@ def transcribe_audio(audio_path, model, logger):
     return result, elapsed
 
 
-import re
-
-def normalize_video_name(filename):
+def normalize_audio_name(filename):
     """
-    Normalize video filename to clean title case, preserving Vietnamese diacritics.
+    Normalize audio filename to clean title case, preserving Vietnamese diacritics.
     
     Rules:
     - Trim whitespace
@@ -492,13 +556,8 @@ def normalize_video_name(filename):
     - Apply title case
     
     Examples:
-        'ai là chủ nhân.mp4'                       → 'Ai Là Chủ Nhân.mp4'
-        'kinh nikaya 15 - kinh sa môn quả (trường bộ).mp4'
-                                                    → 'Kinh Nikaya 15 - Kinh Sa Môn Quả (Trường Bộ).mp4'
-        'su phu noi chuyen - dai le phat dan - 20_05_2024.mp4'
-                                                    → 'Sư Phụ Nói Chuyện - Đại Lễ Phật Đản - 20_05_2024.mp4'
-        'luan ve nhan qua 06 - giong doc huong duong.mp4'
-                                                    → 'Luận Về Nhân Quả 06 - Giọng Đọc Hướng Dương.mp4'
+        'ai la chu nhan.mp3'                        → 'Ai Là Chủ Nhân.mp3'
+        'kinh nikaya 15 - kinh sa mon qua.mp3'      → 'Kinh Nikaya 15 - Kinh Sa Môn Quả.mp3'
     """
     stem = Path(filename).stem
     ext = Path(filename).suffix.lower()
@@ -518,7 +577,7 @@ def normalize_video_name(filename):
     return f"{name}{ext}"
 
 
-def format_result_json(video_name, drive_path, whisper_result, processing_time):
+def format_result_json(audio_name, drive_path, whisper_result, processing_time):
     """Format Whisper result into structured JSON for database import."""
     segments = []
     
@@ -532,9 +591,12 @@ def format_result_json(video_name, drive_path, whisper_result, processing_time):
     
     duration = whisper_result.get("duration", segments[-1]["end"] if segments else 0)
     
+    # Derive video name from audio name (replace .mp3 with original reference)
+    video_name = normalize_audio_name(audio_name)
+    
     return {
-        "video_name": normalize_video_name(video_name),
-        "video_name_original": video_name,
+        "video_name": video_name,
+        "video_name_original": audio_name,
         "drive_path": drive_path,
         "full_text": whisper_result.get("text", "").strip(),
         "duration": round(duration, 2),
@@ -547,70 +609,54 @@ def format_result_json(video_name, drive_path, whisper_result, processing_time):
     }
 
 # ============================================================
-# PREFETCH (Download + Extract Audio in Background)
+# PREFETCH (Download MP3 in Background)
 # ============================================================
 class Prefetcher:
     """
-    Background thread that downloads the NEXT video and extracts audio
-    while the main thread is busy transcribing the CURRENT video.
+    Background thread that downloads the NEXT MP3 file
+    while the main thread is busy transcribing the CURRENT file.
     
     Flow:
         Main Thread:   Transcribe A → Upload A → Transcribe B → Upload B → ...
-        Prefetcher:    Download B + Extract B → Download C + Extract C → ...
+        Prefetcher:    Download B → Download C → ...
     """
     
     def __init__(self, drive_input_path, logger):
         self.drive_input_path = drive_input_path
         self.logger = logger
-        self.queue = Queue(maxsize=1)  # Only prefetch 1 video ahead
+        self.queue = Queue(maxsize=1)  # Only prefetch 1 audio ahead
         self._thread = None
         self._stop = threading.Event()
     
-    def prefetch(self, video_info):
+    def prefetch(self, audio_info):
         """
-        Download video and extract audio in background.
-        Puts (video_path, audio_path, video_info) into queue when ready.
-        Puts (None, None, video_info) if failed.
+        Download MP3 from Google Drive in background.
+        Puts (audio_path, audio_info) into queue when ready.
+        Puts (None, audio_info) if failed.
         """
-        video_name = Path(video_info["Path"]).stem
-        remote_path = f"{self.drive_input_path}/{video_info['Path']}"
-        local_video = os.path.join(LOCAL_WORK_DIR, "download", video_info["Path"])
-        local_audio = os.path.join(LOCAL_WORK_DIR, "audio", f"{video_name}.mp3")
+        audio_name = audio_info["Path"]
+        remote_path = f"{self.drive_input_path}/{audio_name}"
+        local_audio = os.path.join(LOCAL_WORK_DIR, "audio", audio_name)
         
         try:
-            # Step 1: Download video
-            self.logger.info(f"[Prefetch] Downloading: {video_info['Path']}")
-            ok = rclone_download(remote_path, local_video, self.logger)
+            # Download MP3
+            self.logger.info(f"[Prefetch] Downloading: {audio_name}")
+            ok = rclone_download(remote_path, local_audio, self.logger)
             if not ok:
-                self.queue.put((None, None, video_info))
+                self.queue.put((None, audio_info))
                 return
             
-            # Step 2: Extract audio
-            self.logger.info(f"[Prefetch] Extracting audio: {video_info['Path']}")
-            ok = extract_audio(local_video, local_audio, self.logger)
-            if not ok:
-                # Cleanup failed video
-                if os.path.exists(local_video):
-                    os.remove(local_video)
-                self.queue.put((None, None, video_info))
-                return
-            
-            # Step 3: Delete video file (we only need audio for transcription)
-            if os.path.exists(local_video):
-                os.remove(local_video)
-                self.logger.debug(f"[Prefetch] Deleted video (keeping audio): {Path(local_video).name}")
-            
-            self.queue.put((local_video, local_audio, video_info))
+            self.queue.put((local_audio, audio_info))
             
         except Exception as e:
             self.logger.error(f"[Prefetch] Error: {e}")
-            self.queue.put((None, None, video_info))
+            self.queue.put((None, audio_info))
     
-    def start_prefetch(self, video_info):
-        """Start prefetching a video in background thread."""
+    def start_prefetch(self, audio_info):
+        """Start prefetching an audio file in background thread."""
         self._thread = threading.Thread(
             target=self.prefetch,
-            args=(video_info,),
+            args=(audio_info,),
             name="Prefetcher",
             daemon=True
         )
@@ -628,43 +674,42 @@ class Prefetcher:
 # ============================================================
 # MAIN PIPELINE
 # ============================================================
-def process_video(audio_path, video_info, model, drive_output_path, checkpoint, logger):
+def process_audio(audio_path, audio_info, model, drive_output_path, checkpoint, logger):
     """
-    Process a single video (audio already extracted by prefetcher):
+    Process a single audio file (already downloaded from Drive):
     1. Transcribe audio → JSON + SRT
-    2. Upload JSON, SRT, MP3 to Drive
+    2. Upload JSON, SRT to Drive
     3. Update checkpoint
-    4. Cleanup local files
+    4. Cleanup local files (audio + output)
     """
-    video_path_on_drive = video_info["Path"]
-    video_name = Path(video_path_on_drive).stem
+    audio_rel_path = audio_info["Path"]
+    audio_name = Path(audio_rel_path).stem
     
     # Local output paths
-    local_json = os.path.join(LOCAL_WORK_DIR, "output", f"{video_name}.json")
-    local_srt = os.path.join(LOCAL_WORK_DIR, "output", f"{video_name}.srt")
+    local_json = os.path.join(LOCAL_WORK_DIR, "output", f"{audio_name}.json")
+    local_srt = os.path.join(LOCAL_WORK_DIR, "output", f"{audio_name}.srt")
     os.makedirs(os.path.dirname(local_json), exist_ok=True)
     
     # Remote output paths
-    remote_json = f"{drive_output_path}/JSON/{video_name}.json"
-    remote_srt = f"{drive_output_path}/SRT/{video_name}.srt"
-    remote_mp3 = f"{drive_output_path}/Audio/{video_name}.mp3"
+    remote_json = f"{drive_output_path}/JSON/{audio_name}.json"
+    remote_srt = f"{drive_output_path}/SRT/{audio_name}.srt"
     
     total_start = time.time()
     
     try:
         # ===== STEP 1: Transcribe =====
         logger.info(f"{'='*60}")
-        logger.info(f"🎬 Processing: {video_path_on_drive}")
+        logger.info(f"🎬 Processing: {audio_rel_path}")
         logger.info(f"{'='*60}")
         
-        checkpoint.mark_processing(video_path_on_drive)
+        checkpoint.mark_processing(audio_rel_path)
         
         whisper_result, transcribe_time = transcribe_audio(audio_path, model, logger)
         
         # ===== STEP 2: Generate JSON =====
         formatted = format_result_json(
-            video_name=Path(video_path_on_drive).name,
-            drive_path=video_path_on_drive,
+            audio_name=Path(audio_rel_path).name,
+            drive_path=audio_rel_path,
             whisper_result=whisper_result,
             processing_time=transcribe_time
         )
@@ -684,8 +729,6 @@ def process_video(audio_path, video_info, model, drive_output_path, checkpoint, 
             upload_ok = False
         if not rclone_upload(local_srt, remote_srt, logger):
             upload_ok = False
-        if not rclone_upload(audio_path, remote_mp3, logger):
-            upload_ok = False
         
         if not upload_ok:
             logger.warning("⚠️  Some uploads failed, but continuing...")
@@ -693,20 +736,19 @@ def process_video(audio_path, video_info, model, drive_output_path, checkpoint, 
         # ===== STEP 5: Update Checkpoint =====
         total_time = time.time() - total_start
         checkpoint.mark_done(
-            video_path=video_path_on_drive,
+            audio_path=audio_rel_path,
             processing_time=total_time,
             output_json=remote_json,
-            output_srt=remote_srt,
-            output_mp3=remote_mp3
+            output_srt=remote_srt
         )
         
-        # ===== STEP 6: Cleanup =====
+        # ===== STEP 6: Cleanup ALL local files =====
         for f in [local_json, local_srt, audio_path]:
             if os.path.exists(f):
                 os.remove(f)
                 logger.debug(f"🗑️  Deleted: {f}")
         
-        logger.info(f"✅ DONE: {video_path_on_drive} | "
+        logger.info(f"✅ DONE: {audio_rel_path} | "
                      f"Transcribe: {transcribe_time:.1f}s | "
                      f"Total: {total_time:.1f}s | "
                      f"Segments: {formatted['total_segments']}")
@@ -715,8 +757,8 @@ def process_video(audio_path, video_info, model, drive_output_path, checkpoint, 
         
     except Exception as e:
         total_time = time.time() - total_start
-        logger.error(f"❌ FAILED: {video_path_on_drive} ({total_time:.1f}s): {e}", exc_info=True)
-        checkpoint.mark_failed(video_path_on_drive, str(e))
+        logger.error(f"❌ FAILED: {audio_rel_path} ({total_time:.1f}s): {e}", exc_info=True)
+        checkpoint.mark_failed(audio_rel_path, str(e))
         
         # Cleanup on failure
         for f in [local_json, local_srt, audio_path]:
@@ -728,33 +770,33 @@ def process_video(audio_path, video_info, model, drive_output_path, checkpoint, 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Video Transcription Pipeline (Spot Instance Safe)",
+        description="Audio Transcription Pipeline (Spot Instance Safe)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Process all videos in Drive folder
-  python3 transcribe.py --drive-input "BaiGiang" --drive-output "Output"
+  # Process all MP3 files in Drive folder
+  python3 transcribe.py --drive-input "Output/Audio" --drive-output "Output"
   
-  # Test with first video only
-  python3 transcribe.py --drive-input "BaiGiang" --drive-output "Output" --test
+  # Test with first audio file only
+  python3 transcribe.py --drive-input "Output/Audio" --drive-output "Output" --test
   
   # Use medium model (faster, less accurate)
-  python3 transcribe.py --drive-input "BaiGiang" --drive-output "Output" --model medium
+  python3 transcribe.py --drive-input "Output/Audio" --drive-output "Output" --model medium
   
-  # Process only 10 videos
-  python3 transcribe.py --drive-input "BaiGiang" --drive-output "Output" --batch-size 10
+  # Process only 10 files
+  python3 transcribe.py --drive-input "Output/Audio" --drive-output "Output" --batch-size 10
         """
     )
     parser.add_argument("--drive-input", type=str, required=True,
-                        help="Google Drive folder path containing videos (e.g. 'BaiGiang/LichSu')")
+                        help="Google Drive folder path containing MP3 files (e.g. 'Output/Audio')")
     parser.add_argument("--drive-output", type=str, required=True,
                         help="Google Drive folder path for output (e.g. 'Output')")
     parser.add_argument("--model", type=str, default=DEFAULT_WHISPER_MODEL,
                         help=f"Whisper model (default: {DEFAULT_WHISPER_MODEL})")
     parser.add_argument("--test", action="store_true",
-                        help="Test mode: process only first video")
+                        help="Test mode: process only first audio file")
     parser.add_argument("--batch-size", type=int, default=0,
-                        help="Process N videos then stop (0 = all)")
+                        help="Process N files then stop (0 = all)")
     
     args = parser.parse_args()
     
@@ -763,7 +805,7 @@ Examples:
     logger = setup_logging()
     
     logger.info("=" * 60)
-    logger.info("🚀 VIDEO TRANSCRIPTION PIPELINE")
+    logger.info("🚀 AUDIO TRANSCRIPTION PIPELINE")
     logger.info("=" * 60)
     logger.info(f"Drive input:  {RCLONE_REMOTE}:{args.drive_input}")
     logger.info(f"Drive output: {RCLONE_REMOTE}:{args.drive_output}")
@@ -776,25 +818,25 @@ Examples:
     checkpoint = CheckpointManager(args.drive_output, logger)
     checkpoint.load()
     
-    # ===== STEP 2: List Videos =====
-    all_videos = rclone_list_files(args.drive_input, logger)
-    if not all_videos:
-        logger.error("No video files found. Check --drive-input path.")
+    # ===== STEP 2: List Audio Files =====
+    all_audios = rclone_list_files(args.drive_input, logger)
+    if not all_audios:
+        logger.error("No audio files found. Check --drive-input path.")
         sys.exit(1)
     
-    # ===== STEP 3: Filter Pending Videos =====
-    pending_videos = checkpoint.get_pending_videos(all_videos)
-    if not pending_videos:
-        logger.info("🎉 All videos already processed! Nothing to do.")
+    # ===== STEP 3: Filter Pending Audio Files =====
+    pending_audios = checkpoint.get_pending_audios(all_audios)
+    if not pending_audios:
+        logger.info("🎉 All audio files already processed! Nothing to do.")
         sys.exit(0)
     
     # Apply batch size / test mode
     if args.test:
-        pending_videos = pending_videos[:1]
-        logger.info("🧪 TEST MODE: Processing only 1 video")
+        pending_audios = pending_audios[:1]
+        logger.info("🧪 TEST MODE: Processing only 1 audio file")
     elif args.batch_size > 0:
-        pending_videos = pending_videos[:args.batch_size]
-        logger.info(f"📦 BATCH MODE: Processing {len(pending_videos)} videos")
+        pending_audios = pending_audios[:args.batch_size]
+        logger.info(f"📦 BATCH MODE: Processing {len(pending_audios)} audio files")
     
     # ===== STEP 4: Load Whisper Model (faster-whisper) =====
     logger.info(f"🧠 Loading faster-whisper model: {args.model}")
@@ -810,54 +852,55 @@ Examples:
     
     # ===== STEP 5: Pipeline Processing =====
     prefetcher = Prefetcher(args.drive_input, logger)
-    total = len(pending_videos)
+    total = len(pending_audios)
     success_count = 0
     fail_count = 0
+    pipeline_start = time.time()
     
-    # Start prefetching first video
+    # Start prefetching first audio
     logger.info(f"\n{'='*60}")
-    logger.info(f"📋 Starting pipeline: {total} videos to process")
+    logger.info(f"📋 Starting pipeline: {total} audio files to process")
     logger.info(f"{'='*60}\n")
     
-    # Prefetch first video
-    prefetcher.start_prefetch(pending_videos[0])
+    # Prefetch first audio
+    prefetcher.start_prefetch(pending_audios[0])
     
-    for idx, video_info in enumerate(pending_videos):
-        # Start prefetching NEXT video (if available)
+    for idx, audio_info in enumerate(pending_audios):
+        # Start prefetching NEXT audio (if available)
         if idx + 1 < total:
-            next_video = pending_videos[idx + 1]
+            next_audio = pending_audios[idx + 1]
         else:
-            next_video = None
+            next_audio = None
         
-        # Wait for current video's prefetch to complete (max 20 min)
-        logger.info(f"\n[{idx+1}/{total}] Waiting for download + audio extraction...")
+        # Wait for current audio's prefetch to complete (max 10 min for MP3)
+        logger.info(f"\n[{idx+1}/{total}] Waiting for MP3 download...")
         try:
-            _, audio_path, fetched_info = prefetcher.get_result(timeout=1200)
+            audio_path, fetched_info = prefetcher.get_result(timeout=600)
         except Exception:
-            logger.error(f"[{idx+1}/{total}] TIMEOUT waiting for prefetch: {video_info['Path']}")
-            checkpoint.mark_failed(video_info["Path"], "Prefetch timeout (>20min)")
+            logger.error(f"[{idx+1}/{total}] TIMEOUT waiting for download: {audio_info['Path']}")
+            checkpoint.mark_failed(audio_info["Path"], "Download timeout (>10min)")
             fail_count += 1
-            # Kill stuck prefetcher and start fresh for next video
-            if next_video:
+            # Kill stuck prefetcher and start fresh for next audio
+            if next_audio:
                 prefetcher = Prefetcher(args.drive_input, logger)
-                prefetcher.start_prefetch(next_video)
+                prefetcher.start_prefetch(next_audio)
             continue
         
-        # Start prefetching next video immediately (pipeline!)
-        if next_video:
-            prefetcher.start_prefetch(next_video)
-            logger.debug(f"[Pipeline] Prefetching next: {next_video['Path']}")
+        # Start prefetching next audio immediately (pipeline!)
+        if next_audio:
+            prefetcher.start_prefetch(next_audio)
+            logger.debug(f"[Pipeline] Prefetching next: {next_audio['Path']}")
         
-        # Process current video
+        # Process current audio
         if audio_path is None:
-            logger.error(f"[{idx+1}/{total}] Skipping (download/extract failed): {video_info['Path']}")
-            checkpoint.mark_failed(video_info["Path"], "Download or audio extraction failed")
+            logger.error(f"[{idx+1}/{total}] Skipping (download failed): {audio_info['Path']}")
+            checkpoint.mark_failed(audio_info["Path"], "Download failed")
             fail_count += 1
             continue
         
-        success = process_video(
+        success = process_audio(
             audio_path=audio_path,
-            video_info=video_info,
+            audio_info=audio_info,
             model=model,
             drive_output_path=args.drive_output,
             checkpoint=checkpoint,
@@ -869,19 +912,27 @@ Examples:
         else:
             fail_count += 1
         
-        # Progress report
-        elapsed_videos = idx + 1
-        eta_per_video = (time.time() - time.time()) if idx == 0 else None  # Placeholder
-        logger.info(f"📊 Progress: [{elapsed_videos}/{total}] | ✅ {success_count} | ❌ {fail_count}")
+        # Progress report with ETA
+        elapsed = time.time() - pipeline_start
+        avg_per_audio = elapsed / (idx + 1)
+        remaining = (total - idx - 1) * avg_per_audio
+        remaining_str = str(timedelta(seconds=int(remaining)))
+        
+        logger.info(f"📊 Progress: [{idx+1}/{total}] | ✅ {success_count} | ❌ {fail_count} | "
+                     f"Avg: {avg_per_audio:.0f}s/file | ETA: {remaining_str}")
     
     # ===== FINAL SUMMARY =====
+    total_elapsed = time.time() - pipeline_start
+    total_elapsed_str = str(timedelta(seconds=int(total_elapsed)))
+    
     logger.info(f"\n{'='*60}")
     logger.info(f"🏁 PIPELINE COMPLETED!")
     logger.info(f"{'='*60}")
-    logger.info(f"Total: {total}")
-    logger.info(f"Success: {success_count}")
-    logger.info(f"Failed: {fail_count}")
-    logger.info(f"Output: {RCLONE_REMOTE}:{args.drive_output}/")
+    logger.info(f"Total files:  {total}")
+    logger.info(f"Success:      {success_count}")
+    logger.info(f"Failed:       {fail_count}")
+    logger.info(f"Total time:   {total_elapsed_str}")
+    logger.info(f"Output:       {RCLONE_REMOTE}:{args.drive_output}/")
     logger.info(f"{'='*60}")
 
 
