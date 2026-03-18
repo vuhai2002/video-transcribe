@@ -112,7 +112,7 @@ def check_exists_on_drive(remote_srt_path, logger):
 # ============================================================
 # GEMINI CORE LOGIC
 # ============================================================
-def call_gemini_api(local_audio_path, model_name, logger):
+def call_gemini_api(local_audio_path, model_name, logger, max_retries=3):
     file_name = os.path.basename(local_audio_path)
     remote_file = None
     
@@ -153,11 +153,12 @@ def call_gemini_api(local_audio_path, model_name, logger):
         ]
 
         # 4. Generate with Retry Loop (Manual Retry for 500 errors)
-        max_retries = 3
-        for attempt in range(max_retries):
+        total_attempts = max_retries + 1
+        for attempt in range(total_attempts):
             try:
                 response = model.generate_content(
                     [remote_file, prompt],
+                    generation_config={"max_output_tokens": 65536},
                     request_options={"timeout": 1200},
                     safety_settings=safety_settings
                 )
@@ -180,8 +181,8 @@ def call_gemini_api(local_audio_path, model_name, logger):
                         return None
                     
                     # If it's empty response
-                    logger.warning(f"   ⚠️  [{file_name}] [Attempt {attempt+1}] Finish Reason: {reason_str}. Content empty.")
-                    if attempt < max_retries - 1:
+                    logger.warning(f"   ⚠️  [{file_name}] [Attempt {attempt+1}/{total_attempts}] Finish Reason: {reason_str}. Content empty.")
+                    if attempt < total_attempts - 1:
                         time.sleep(5)
                         continue
                     return None
@@ -196,10 +197,10 @@ def call_gemini_api(local_audio_path, model_name, logger):
                 return text_result.strip()
 
             except exceptions.InternalServerError:
-                logger.warning(f"   🔥 [{file_name}] [Attempt {attempt+1}] Server Error (500). Retrying...")
+                logger.warning(f"   🔥 [{file_name}] [Attempt {attempt+1}/{total_attempts}] Server Error (500). Retrying...")
                 time.sleep(10)
             except exceptions.ServiceUnavailable:
-                logger.warning(f"   🔥 [{file_name}] [Attempt {attempt+1}] Service Unavailable (503). Retrying...")
+                logger.warning(f"   🔥 [{file_name}] [Attempt {attempt+1}/{total_attempts}] Service Unavailable (503). Retrying...")
                 time.sleep(10)
             except ValueError as ve:
                 # Catch "response.text quick accessor" error here
@@ -226,7 +227,7 @@ def call_gemini_api(local_audio_path, model_name, logger):
 # ============================================================
 # WORKER PIPELINE
 # ============================================================
-def process_single_file(file_info, drive_input, drive_output, model_name, logger):
+def process_single_file(file_info, drive_input, drive_output, model_name, logger, max_retries=3):
     rel_path = file_info["Path"]
     file_name = os.path.basename(rel_path)
     base_name = os.path.splitext(file_name)[0]
@@ -251,7 +252,7 @@ def process_single_file(file_info, drive_input, drive_output, model_name, logger
             return "DOWNLOAD_FAILED"
             
         # 2. Transcribe via Gemini
-        srt_content = call_gemini_api(local_audio, model_name, logger)
+        srt_content = call_gemini_api(local_audio, model_name, logger, max_retries=max_retries)
         
         if not srt_content:
             # Nếu thất bại, xóa file audio local để tránh rác
@@ -289,6 +290,7 @@ def main():
     parser.add_argument("--api-key", help="Gemini API Key")
     parser.add_argument("--model", default=DEFAULT_MODEL, help="Model name")
     parser.add_argument("--workers", type=int, default=3, help="Số luồng chạy song song")
+    parser.add_argument("--retry", type=int, default=3, help="Số lần retry khi lỗi (0 = không retry, mặc định: 3)")
     
     args = parser.parse_args()
     
@@ -305,6 +307,7 @@ def main():
     logger.info(f"🚀 GEMINI TRANSCRIPTION (ROBUST MODE)")
     logger.info(f"   Model:   {args.model}")
     logger.info(f"   Workers: {args.workers}")
+    logger.info(f"   Retry:   {args.retry}")
     logger.info("="*50)
 
     # 1. List Files
@@ -329,7 +332,8 @@ def main():
                 args.drive_input, 
                 args.drive_output, 
                 args.model, 
-                logger
+                logger,
+                max_retries=args.retry
             ): f for f in all_files
         }
         
