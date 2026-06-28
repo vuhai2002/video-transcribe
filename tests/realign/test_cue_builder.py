@@ -1,0 +1,57 @@
+import realign.config as cfg
+from realign.text_metrics import char_count
+from realign.cue_builder import fill_word_times, build_cues
+
+
+def W(w, s, e, score=0.9):
+    return {"w": w, "start": s, "end": e, "score": score}
+
+
+def test_fill_word_times_interpolates_none():
+    out = fill_word_times([W("a", 0.0, 0.5), W("b", None, None), W("c", 1.0, 1.5)])
+    assert out[1]["start"] == 0.5 and out[1]["end"] >= 0.5
+
+
+def test_sentence_split_when_each_cue_meets_min_display():
+    # 2 câu, mỗi cue đủ dài (>=1.5s) -> KHÔNG gộp -> 2 cue
+    cues = build_cues([W("Một.", 0.0, 2.0), W("Hai.", 2.1, 4.0)], cfg)
+    assert len(cues) == 2
+    assert cues[0]["text"] == "Một." and cues[1]["text"] == "Hai."
+
+
+def test_pause_splits_into_two_cues():
+    # gap 0.7s >= PAUSE_SPLIT (0.6) -> ngắt; mỗi cue kéo đủ 1.5s
+    cues = build_cues([W("alpha", 0.0, 1.6), W("beta", 2.3, 3.9)], cfg)
+    assert len(cues) == 2
+
+
+def test_char_max_forces_split():
+    words = [W(f"w{i:02d}", i * 1.0, i * 1.0 + 0.8) for i in range(40)]  # ~ vượt 84 ký tự
+    cues = build_cues(words, cfg)
+    assert len(cues) >= 2
+    for c in cues:
+        assert all(char_count(ln) <= cfg.CPL_MAX for ln in c["text"].split("\n"))
+
+
+def test_cps_floor_extends_short_cue_into_gap():
+    # 1 cue ~60 ký tự cần >= 60/15 = 4.0s; audio chỉ 1s; có gap dài phía sau -> kéo dài
+    text_words = ["chu" + str(i) for i in range(12)]  # ~ 12*5+11 = 71 ký tự, 1 cue
+    words = [W(w, 0.0 + i * 0.08, 0.0 + i * 0.08 + 0.07) for i, w in enumerate(text_words)]
+    # kết thúc ~0.96s, không câu/pause nội bộ -> 1 cue; không có cue sau -> cap = start+DUR_MAX
+    cues = build_cues(words, cfg)
+    assert len(cues) == 1
+    dur = cues[0]["end"] - cues[0]["start"]
+    chars = char_count(cues[0]["text"])
+    assert dur >= chars / cfg.CPS_MAX - 1e-6   # đạt trần tốc độ đọc
+
+
+def test_tiny_back_to_back_cue_merged_no_flash():
+    # câu ngắn "Vâng." 0.4s, ngay sau là câu dài, KHÔNG có gap -> gộp, không để cue < 1.5s
+    words = [W("Vâng.", 0.0, 0.4)] + [W(f"x{i}", 0.45 + i * 0.5, 0.45 + i * 0.5 + 0.45) for i in range(5)]
+    cues = build_cues(words, cfg)
+    for c in cues:
+        assert (c["end"] - c["start"]) >= cfg.DUR_MIN - 1e-6   # không còn cue chớp
+
+
+def test_no_words_returns_empty():
+    assert build_cues([], cfg) == []

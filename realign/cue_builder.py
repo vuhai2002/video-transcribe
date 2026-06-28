@@ -1,0 +1,106 @@
+"""Gom word-level -> cue theo luật production (Netflix VN / BBC / ESIST).
+Ngắt: hết câu | lặng >= PAUSE_SPLIT | không xuống được <= 2 dòng <= CPL. Ép tốc độ đọc CPS. Gộp cue vụn."""
+import realign.config as config
+from realign.text_metrics import char_count, wrap_two_lines
+
+
+def fill_word_times(words: list[dict]) -> list[dict]:
+    words = [dict(w) for w in words]
+    n = len(words)
+    for i, w in enumerate(words):
+        if w.get("start") is None or w.get("end") is None:
+            prev_e = next((words[j]["end"] for j in range(i - 1, -1, -1)
+                           if words[j].get("end") is not None), 0.0)
+            nxt_s = next((words[j]["start"] for j in range(i + 1, n)
+                          if words[j].get("start") is not None), prev_e + 0.3)
+            w["start"] = prev_e
+            w["end"] = max(prev_e + 0.05, nxt_s)
+    return words
+
+
+def _make_cue(ws: list[dict]) -> dict:
+    return {"text": " ".join(w["w"] for w in ws),
+            "start": ws[0]["start"], "end": ws[-1]["end"]}
+
+
+def _fits_lines(text: str, cfg) -> bool:
+    """True nếu text word-wrap được vào <= LINES_MAX dòng, mỗi dòng <= CPL_MAX
+    (word-wrap tham lam, không cắt đôi từ). Thay cho mốc CHAR_MAX cũ."""
+    lines, cur = 1, 0
+    for word in text.split(" "):
+        wlen = char_count(word)
+        if wlen > cfg.CPL_MAX:
+            return False                       # 1 từ đã dài hơn 1 dòng
+        if cur == 0:
+            cur = wlen
+        elif cur + 1 + wlen <= cfg.CPL_MAX:
+            cur += 1 + wlen
+        else:
+            lines += 1
+            cur = wlen
+            if lines > cfg.LINES_MAX:
+                return False
+    return lines <= cfg.LINES_MAX
+
+
+def _group_raw(words: list[dict], cfg) -> list[dict]:
+    ends = tuple(cfg.SENTENCE_END)
+    cues, cur = [], []
+    for w in words:
+        if cur:
+            prev = cur[-1]
+            sentence = prev["w"].endswith(ends)
+            pause = (w["start"] - prev["end"]) >= cfg.PAUSE_SPLIT
+            over = not _fits_lines(" ".join(x["w"] for x in cur) + " " + w["w"], cfg)
+            if sentence or pause or over:
+                cues.append(_make_cue(cur))
+                cur = []
+        cur.append(w)
+    if cur:
+        cues.append(_make_cue(cur))
+    return cues
+
+
+def _enforce_min_display(cues: list[dict], cfg) -> list[dict]:
+    out, i = [], 0
+    while i < len(cues):
+        c = dict(cues[i])
+        needed = max(cfg.DUR_MIN, char_count(c["text"]) / cfg.CPS_MAX)
+        nxt_start = cues[i + 1]["start"] if i + 1 < len(cues) else None
+        cap = c["start"] + cfg.DUR_MAX
+        if nxt_start is not None:
+            cap = min(cap, nxt_start - cfg.GAP_MIN)
+        want_end = min(max(c["end"], c["start"] + needed), cap)
+        if (want_end - c["start"]) >= cfg.DUR_MIN - 1e-6:
+            c["end"] = want_end
+            out.append(c)
+            i += 1
+            continue
+        # không đủ chỗ đạt sàn -> gộp vào cue trước (ưu tiên) hoặc cue sau, nếu char vừa
+        if out and char_count(out[-1]["text"] + " " + c["text"]) <= cfg.CHAR_MAX:
+            out[-1]["text"] += " " + c["text"]
+            out[-1]["end"] = max(out[-1]["end"], c["end"])
+            i += 1
+            continue
+        if i + 1 < len(cues) and char_count(c["text"] + " " + cues[i + 1]["text"]) <= cfg.CHAR_MAX:
+            nxt = dict(cues[i + 1])
+            nxt["text"] = c["text"] + " " + nxt["text"]
+            nxt["start"] = c["start"]
+            cues[i + 1] = nxt
+            i += 1
+            continue
+        # không gộp được -> chấp nhận, ít nhất đạt FLOOR
+        c["end"] = max(c["end"], want_end, c["start"] + cfg.FLOOR)
+        out.append(c)
+        i += 1
+    return out
+
+
+def build_cues(words: list[dict], cfg=config) -> list[dict]:
+    if not words:
+        return []
+    words = fill_word_times(words)
+    cues = _enforce_min_display(_group_raw(words, cfg), cfg)
+    for c in cues:
+        c["text"] = wrap_two_lines(c["text"], cfg.CPL_MAX)
+    return cues
