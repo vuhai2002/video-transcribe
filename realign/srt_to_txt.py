@@ -31,7 +31,8 @@ def main():
     ap.add_argument("--srt", required=True)
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
-    text = open(a.srt, encoding="utf-8").read()
+    with open(a.srt, encoding="utf-8") as f:
+        text = f.read()
     with open(a.out, "w", encoding="utf-8") as f:
         f.write(srt_to_transcript(text) + "\n")
     print(f"wrote transcript -> {a.out}")
