@@ -28,7 +28,7 @@ def index_audio(audio_dirs: list[str]) -> dict[str, str]:
     return idx
 
 
-def build_pairs(srt_dir: str, audio_dirs: list[str]):
+def build_pairs(srt_dir: str, audio_dirs: list[str]) -> tuple[list[dict], list[dict], list[dict]]:
     """Ghép .srt <-> .mp3.
 
     Args:
@@ -41,6 +41,8 @@ def build_pairs(srt_dir: str, audio_dirs: list[str]):
         - unpaired_srt: list[dict] = [{"srt_name", "srt_path", "key"}, ...]
         - unpaired_audio: list[dict] = [{"audio_name", "audio_path", "key"}, ...]
     """
+    if not os.path.isdir(srt_dir):
+        raise ValueError(f"srt_dir not found or not a directory: {srt_dir!r}")
     audio_idx = index_audio(audio_dirs)
     used: set[str] = set()
     pairs, unpaired_srt = [], []
@@ -60,7 +62,7 @@ def build_pairs(srt_dir: str, audio_dirs: list[str]):
     return pairs, unpaired_srt, unpaired_audio
 
 
-def format_unpaired_report(unpaired_srt, unpaired_audio) -> str:
+def format_unpaired_report(unpaired_srt: list[dict], unpaired_audio: list[dict]) -> str:
     """Format báo cáo file lẻ (chưa ghép được)."""
     out = ["# File lẻ (chưa ghép được)", "",
            f"## SRT không có audio ({len(unpaired_srt)})"]

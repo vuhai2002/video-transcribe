@@ -1,5 +1,5 @@
 from realign.pair_audio_srt import (
-    normalize_key, build_pairs, format_unpaired_report,
+    normalize_key, build_pairs, format_unpaired_report, index_audio,
 )
 
 
@@ -16,8 +16,8 @@ def test_build_pairs_matches_case_and_diacritic_insensitive(tmp_path):
     audio = tmp_path / "a1"; audio.mkdir()
     (srt_dir / "Đạo làm con B.srt").write_text("x", encoding="utf-8")
     (srt_dir / "Khong co audio.srt").write_text("x", encoding="utf-8")
-    (audio / "đạo làm con b.mp3").write_bytes(b"")     # khac hoa/thuong + dau van match
-    (audio / "Bai le thua.mp3").write_bytes(b"")       # khong co srt -> unpaired_audio
+    (audio / "đạo làm con b.mp3").write_bytes(b"")     # khác hoa/thường + dấu vẫn match
+    (audio / "Bai le thua.mp3").write_bytes(b"")       # không có srt -> unpaired_audio
 
     pairs, unpaired_srt, unpaired_audio = build_pairs(str(srt_dir), [str(audio)])
 
@@ -35,3 +35,18 @@ def test_format_unpaired_report_lists_both():
         [{"audio_name": "B.mp3", "key": "b"}],
     )
     assert "A.srt" in txt and "B.mp3" in txt
+
+
+def test_index_audio_skips_missing_dir(tmp_path):
+    real = tmp_path / "a"; real.mkdir()
+    (real / "Bai.mp3").write_bytes(b"")
+    idx = index_audio([str(real), str(tmp_path / "khong-ton-tai")])
+    assert idx == {"bai": str(real / "Bai.mp3")}
+
+
+def test_index_audio_dedupes_by_normalized_key(tmp_path):
+    d = tmp_path / "a"; d.mkdir()
+    (d / "Bài.mp3").write_bytes(b"")   # khác dấu nhưng cùng key "bai"
+    (d / "Bai.mp3").write_bytes(b"")
+    idx = index_audio([str(d)])
+    assert list(idx.keys()) == ["bai"]
