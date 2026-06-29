@@ -25,8 +25,8 @@ def test_pause_splits_into_two_cues():
     assert len(cues) == 2
 
 
-def test_char_max_forces_split():
-    words = [W(f"w{i:02d}", i * 1.0, i * 1.0 + 0.8) for i in range(40)]  # ~ vượt 84 ký tự
+def test_long_run_splits_to_keep_lines_within_cpl():
+    words = [W(f"w{i:02d}", i * 1.0, i * 1.0 + 0.8) for i in range(40)]  # buộc ngắt để giữ <= 2 dòng <= CPL
     cues = build_cues(words, cfg)
     assert len(cues) >= 2
     for c in cues:
@@ -51,6 +51,19 @@ def test_tiny_back_to_back_cue_merged_no_flash():
     cues = build_cues(words, cfg)
     for c in cues:
         assert (c["end"] - c["start"]) >= cfg.DUR_MIN - 1e-6   # không còn cue chớp
+
+
+def test_merge_never_creates_over_cpl_line():
+    # cue vụn "Vâng." ngay trước 1 câu dài, không gap -> không được gộp thành cue > CPL
+    words = [W("Vâng.", 0.0, 0.05)] + [W("abc", 0.1 + i * 0.5, 0.1 + i * 0.5 + 0.45) for i in range(20)]
+    cues = build_cues(words, cfg)
+    for c in cues:
+        assert all(char_count(ln) <= cfg.CPL_MAX for ln in c["text"].split("\n"))
+
+
+def test_single_overlong_word_does_not_crash():
+    cues = build_cues([W("x" * 50, 0.0, 3.0)], cfg)
+    assert len(cues) == 1
 
 
 def test_no_words_returns_empty():

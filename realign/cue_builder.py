@@ -77,12 +77,12 @@ def _enforce_min_display(cues: list[dict], cfg) -> list[dict]:
             i += 1
             continue
         # không đủ chỗ đạt sàn -> gộp vào cue trước (ưu tiên) hoặc cue sau, nếu char vừa
-        if out and char_count(out[-1]["text"] + " " + c["text"]) <= cfg.CHAR_MAX:
+        if out and _fits_lines(out[-1]["text"] + " " + c["text"], cfg):
             out[-1]["text"] += " " + c["text"]
             out[-1]["end"] = max(out[-1]["end"], c["end"])
             i += 1
             continue
-        if i + 1 < len(cues) and char_count(c["text"] + " " + cues[i + 1]["text"]) <= cfg.CHAR_MAX:
+        if i + 1 < len(cues) and _fits_lines(c["text"] + " " + cues[i + 1]["text"], cfg):
             nxt = dict(cues[i + 1])
             nxt["text"] = c["text"] + " " + nxt["text"]
             nxt["start"] = c["start"]

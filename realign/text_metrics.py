@@ -10,9 +10,9 @@ def char_count(s: str) -> int:
 
 
 def wrap_two_lines(text: str, cpl_max: int) -> str:
-    if char_count(text) <= cpl_max:
-        return text
     words = text.split(" ")
+    if char_count(text) <= cpl_max or len(words) < 2:
+        return text                       # 1 từ dài hơn CPL: không cắt đôi được
     best = None  # (key, k)
     for k in range(1, len(words)):
         c1 = char_count(" ".join(words[:k]))
