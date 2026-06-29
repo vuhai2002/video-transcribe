@@ -35,3 +35,14 @@ def test_vad_trailing_trim_but_keeps_min_display():
     out = clamp_cues([C("a", 80.0, 90.0)], (0.0, 85.0), cfg)  # last_speech 85
     assert out[0]["end"] <= 85.0 + cfg.VAD_PAD + 1e-9
     assert (out[0]["end"] - out[0]["start"]) >= cfg.DUR_MIN - 1e-9
+
+
+def test_vad_leading_trim_pushes_start_to_speech_when_room():
+    out = clamp_cues([C("a", 0.0, 6.0)], (2.0, 6.0), cfg)
+    assert abs(out[0]["start"] - 2.0) < 1e-9
+
+
+def test_vad_leading_trim_never_moves_start_backward():
+    # cue đầu ngắn (end-start < DUR_MIN), first_speech > start -> start KHÔNG lùi/âm
+    out = clamp_cues([C("a", 0.0, 1.0), C("b", 5.0, 7.0)], (0.3, 7.0), cfg)
+    assert out[0]["start"] >= 0.0 and abs(out[0]["start"] - 0.0) < 1e-9

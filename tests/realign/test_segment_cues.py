@@ -13,5 +13,5 @@ def test_segment_end_to_end(tmp_path):
     cues = segment(str(wj), str(out))
     assert len(cues) == 2
     text = open(out, encoding="utf-8").read()
-    assert "-->" in text and "Một." in text
+    assert text.startswith("1\n") and "-->" in text and "Một." in text
     assert all(cues[i]["start"] <= cues[i + 1]["start"] for i in range(len(cues) - 1))

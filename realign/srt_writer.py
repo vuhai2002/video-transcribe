@@ -2,12 +2,10 @@
 
 
 def fmt_ts(sec: float) -> str:
-    if sec < 0:
-        sec = 0.0
-    h = int(sec // 3600)
-    m = int((sec % 3600) // 60)
-    s = int(sec % 60)
-    ms = int((sec * 1000) % 1000)
+    total_ms = round(max(sec, 0.0) * 1000)   # round (không truncate) tránh lệch ms
+    h, rem = divmod(total_ms, 3_600_000)
+    m, rem = divmod(rem, 60_000)
+    s, ms = divmod(rem, 1_000)
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 

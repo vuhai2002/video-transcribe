@@ -10,7 +10,8 @@ from realign.srt_writer import cues_to_srt
 
 
 def segment(words_json: str, out_srt: str, vad_region=None, cfg=config) -> list[dict]:
-    data = json.load(open(words_json, encoding="utf-8"))
+    with open(words_json, encoding="utf-8") as f:
+        data = json.load(f)
     cues = build_cues(data["words"], cfg)
     cues = clamp_cues(cues, vad_region, cfg)
     with open(out_srt, "w", encoding="utf-8") as f:
@@ -21,7 +22,8 @@ def segment(words_json: str, out_srt: str, vad_region=None, cfg=config) -> list[
 def _load_vad(path):
     if not path:
         return None
-    d = json.load(open(path, encoding="utf-8"))
+    with open(path, encoding="utf-8") as f:
+        d = json.load(f)
     return (d["first"], d["last"])
 
 

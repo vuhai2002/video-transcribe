@@ -8,9 +8,7 @@ def clamp_cues(cues: list[dict], speech_region, cfg=config) -> list[dict]:
     cues = [dict(c) for c in cues]
     cues.sort(key=lambda c: c["start"])
 
-    for i, c in enumerate(cues):
-        if i > 0 and c["start"] < cues[i - 1]["start"]:
-            c["start"] = cues[i - 1]["start"]
+    for c in cues:  # sort phía trên đã đảm bảo start không giảm
         if c["end"] < c["start"] + cfg.FLOOR:
             c["end"] = c["start"] + cfg.FLOOR
         c["end"] = min(c["end"], c["start"] + cfg.DUR_MAX)
@@ -19,7 +17,8 @@ def clamp_cues(cues: list[dict], speech_region, cfg=config) -> list[dict]:
         first, last = speech_region
         c0 = cues[0]
         if first > c0["start"]:
-            c0["start"] = min(first, c0["end"] - cfg.DUR_MIN)
+            # chỉ đẩy start TỚI first_speech (không lùi/âm); giữ cue >= DUR_MIN
+            c0["start"] = max(c0["start"], min(first, c0["end"] - cfg.DUR_MIN))
         cl = cues[-1]
         cl["end"] = max(min(cl["end"], last + cfg.VAD_PAD), cl["start"] + cfg.DUR_MIN)
 
