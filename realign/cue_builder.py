@@ -1,5 +1,6 @@
 """Gom word-level -> cue theo luật production (Netflix VN / BBC / ESIST).
-Ngắt: hết câu | lặng >= PAUSE_SPLIT | không xuống được <= 2 dòng <= CPL. Ép tốc độ đọc CPS. Gộp cue vụn."""
+Ngắt: hết câu | lặng >= PAUSE_SPLIT -> segment; mỗi segment dài hơn 1 cue
+chia cân bằng (số cue tối thiểu) ưu tiên ngắt ở dấu phẩy. Ép tốc độ đọc CPS. Gộp cue vụn."""
 import realign.config as config
 from realign.text_metrics import char_count, wrap_two_lines
 
@@ -43,22 +44,59 @@ def _fits_lines(text: str, cfg) -> bool:
     return lines <= cfg.LINES_MAX
 
 
-def _group_raw(words: list[dict], cfg) -> list[dict]:
+def _join(words: list[dict]) -> str:
+    return " ".join(w["w"] for w in words)
+
+
+def _split_segments(words: list[dict], cfg) -> list[list[dict]]:
+    """Tách words thành segment tại hard-break: hết câu hoặc khoảng ngừng >= PAUSE_SPLIT."""
     ends = tuple(cfg.SENTENCE_END)
-    cues, cur = [], []
+    segs, cur = [], []
     for w in words:
         if cur:
             prev = cur[-1]
-            sentence = prev["w"].endswith(ends)
-            pause = (w["start"] - prev["end"]) >= cfg.PAUSE_SPLIT
-            over = not _fits_lines(" ".join(x["w"] for x in cur) + " " + w["w"], cfg)
-            if sentence or pause or over:
-                cues.append(_make_cue(cur))
+            if prev["w"].endswith(ends) or (w["start"] - prev["end"]) >= cfg.PAUSE_SPLIT:
+                segs.append(cur)
                 cur = []
         cur.append(w)
     if cur:
-        cues.append(_make_cue(cur))
-    return cues
+        segs.append(cur)
+    return segs
+
+
+def _fill_k(words: list[dict], k: int, cfg) -> list[list[dict]]:
+    """Chia words thành tối đa k nhóm cân bằng (~total/k ký tự mỗi nhóm),
+    ưu tiên ngắt ngay sau dấu phẩy/`;`/`:` khi đã gần target."""
+    target = char_count(_join(words)) / k
+    groups, cur = [], []
+    for i, w in enumerate(words):
+        cur.append(w)
+        if (k - len(groups)) <= 1:                          # nhóm cuối: gom hết phần còn lại
+            continue
+        if (len(words) - i - 1) <= (k - len(groups) - 1):   # chừa đủ từ cho các nhóm sau
+            groups.append(cur)
+            cur = []
+            continue
+        acc = char_count(_join(cur))
+        ends_soft = w["w"].endswith((",", ";", ":"))
+        if (acc >= target * 0.6 and ends_soft) or acc >= target:
+            groups.append(cur)
+            cur = []
+    if cur:
+        groups.append(cur)
+    return groups
+
+
+def _segment_to_cues(words: list[dict], cfg) -> list[list[dict]]:
+    """1 segment -> các nhóm từ, mỗi nhóm <= 2 dòng <= CPL. Segment dài hơn 1 cue
+    -> chia cân bằng (số cue tối thiểu) + ưu tiên ngắt ở dấu phẩy (hết đuôi cụt)."""
+    if _fits_lines(_join(words), cfg):
+        return [words]
+    for k in range(2, len(words) + 1):
+        groups = _fill_k(words, k, cfg)
+        if len(groups) == k and all(_fits_lines(_join(g), cfg) for g in groups):
+            return groups
+    return [[w] for w in words]                             # fallback hiếm (1 từ quá dài)
 
 
 def _enforce_min_display(cues: list[dict], cfg) -> list[dict]:
@@ -100,7 +138,11 @@ def build_cues(words: list[dict], cfg=config) -> list[dict]:
     if not words:
         return []
     words = fill_word_times(words)
-    cues = _enforce_min_display(_group_raw(words, cfg), cfg)
+    raw = []
+    for seg in _split_segments(words, cfg):
+        for group in _segment_to_cues(seg, cfg):
+            raw.append(_make_cue(group))
+    cues = _enforce_min_display(raw, cfg)
     for c in cues:
         c["text"] = wrap_two_lines(c["text"], cfg.CPL_MAX)
     return cues

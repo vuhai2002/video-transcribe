@@ -68,3 +68,14 @@ def test_single_overlong_word_does_not_crash():
 
 def test_no_words_returns_empty():
     assert build_cues([], cfg) == []
+
+
+def test_long_sentence_splits_balanced_at_comma():
+    text = "Hôm nay chúng ta nghe một đoạn pháp cú ngắn thôi, rồi sau đó chúng ta nói qua chuyện khác."
+    toks = text.split()
+    words = [W(t, i * 0.4, i * 0.4 + 0.35) for i, t in enumerate(toks)]   # liên tục, không pause
+    cues = build_cues(words, cfg)
+    assert len(cues) == 2
+    assert cues[0]["text"].replace("\n", " ").rstrip().endswith(",")      # ngắt ở dấu phẩy
+    for c in cues:                                                        # không đuôi cụt
+        assert len(c["text"].replace("\n", " ").split()) >= 3
