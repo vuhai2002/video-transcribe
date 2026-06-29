@@ -45,8 +45,9 @@ def normalize_word(w: str) -> str:
 def read_words(txt_path: str) -> list[str]:
     """Doc toan bo token tu file txt (moi dong la mot cue), giu nguyen thu tu."""
     words: list[str] = []
-    for ln in open(txt_path, encoding="utf-8"):
-        words += ln.split()
+    with open(txt_path, encoding="utf-8") as f:
+        for ln in f:
+            words += ln.split()
     return words
 
 
@@ -86,6 +87,8 @@ def assemble_words(words_raw, align_idx, token_spans, ratio, sr) -> list[dict]:
     times: dict[int, tuple] = {}
     for k, spans in enumerate(token_spans):
         i = align_idx[k]
+        if not spans:
+            continue                       # khong co token -> de tu nay roi vao nhanh None
         start = spans[0].start * ratio / sr
         end = spans[-1].end * ratio / sr
         score = sum(s.score for s in spans) / len(spans)
@@ -106,7 +109,7 @@ def align(
     device: str = "cpu",
     emit_chunk_sec: float = config.EMIT_CHUNK_SEC,
     max_sec: float = 0.0,
-    models=None,
+    models: tuple | None = None,
 ) -> list[dict]:
     """Forced-align words_raw vao audio_path dung MMS_FA.
 
@@ -137,6 +140,7 @@ def align(
 
 
 def main():
+    import os
     import torch
     ap = argparse.ArgumentParser(description="MMS forced-align -> word-level json")
     ap.add_argument("--audio", required=True)
@@ -148,15 +152,13 @@ def main():
     ap.add_argument("--max-sec", type=float, default=0.0)
     a = ap.parse_args()
     words_raw = read_words(a.txt)
+    out_dir = os.path.dirname(a.out_json)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
     t0 = time.time()
     words = align(a.audio, words_raw, a.device, a.emit_chunk_sec, a.max_sec)
-    import os
-    os.makedirs(os.path.dirname(a.out_json), exist_ok=True)
-    json.dump(
-        {"key": a.key or a.audio, "audio": a.audio, "words": words},
-        open(a.out_json, "w", encoding="utf-8"),
-        ensure_ascii=False,
-    )
+    with open(a.out_json, "w", encoding="utf-8") as f:
+        json.dump({"key": a.key or a.audio, "audio": a.audio, "words": words}, f, ensure_ascii=False)
     n_al = sum(1 for w in words if w["start"] is not None)
     print(f"aligned {n_al}/{len(words)} words in {time.time() - t0:.1f}s -> {a.out_json}")
 
