@@ -1,9 +1,24 @@
+# Python
 __pycache__/
 *.pyc
+
+# Secrets / env
 .env
-.venv
+
+# Virtualenvs (.venv, .venv-realign, .venv311, ...)
+.venv*/
 env/
 venv/
+
+# OS
 .DS_Store
+
+# Tools
 rclone.exe
 rclone
+
+# Generated output (batch realign / transcribe pipeline)
+out/
+
+# Test media + fixtures (large audio, srt, txt - not for git)
+test-files/
