@@ -78,15 +78,11 @@ TRANSCRIBE_PROMPT = """\
 Nghe file âm thanh đính kèm và chép lại toàn bộ nội dung thành văn bản (verbatim transcription).
 
 **Yêu cầu bắt buộc:**
-1. Chép chính xác từng từ, không tóm tắt, không bỏ sót từ nào.
-2. Ngắt dòng tự nhiên theo ngữ điệu, mỗi câu hoặc mệnh đề ngắn trên một dòng riêng.
-3. Mỗi dòng tối đa khoảng 60 ký tự để dễ đọc.
-4. Không đánh số dòng, không thêm timestamp, không thêm tiêu đề hay ghi chú.
-5. Không dùng markdown, không dùng code block. Chỉ trả về plain text thuần túy.
-6. Dấu câu: sử dụng dấu chấm, dấu phẩy, dấu hỏi, dấu chấm than... tự nhiên theo ngữ cảnh.
-7. Giữ nguyên ngôn ngữ gốc (tiếng Việt).
-
-Chỉ trả về nội dung văn bản, không có bất kỳ lời dẫn hay giải thích nào.
+1. Chép chính xác từng từ, verbatim, không tóm tắt/bỏ sót.
+2. DẤU CÂU đầy đủ + đúng (QUAN TRỌNG): kết câu bằng . ! ? ; ngắt mệnh đề bằng dấu phẩy.
+3. Giữ ĐẦY ĐỦ dấu tiếng Việt (dấu thanh + ă â đ ê ô ơ ư...), TUYỆT ĐỐI không bỏ dấu.
+4. Không số dòng, không timestamp, không markdown/code block. Plain text. Không cần chia dòng/cue.
+5. Trả về văn bản xuôi, chỉ nội dung, không lời dẫn hay giải thích.
 """
 
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".flac", ".ogg", ".aac", ".wma"}
