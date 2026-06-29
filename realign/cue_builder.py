@@ -1,6 +1,7 @@
 """Gom word-level -> cue theo luật production (Netflix VN / BBC / ESIST).
-Ngắt: hết câu | lặng >= PAUSE_SPLIT -> segment; mỗi segment dài hơn 1 cue
-chia cân bằng (số cue tối thiểu) ưu tiên ngắt ở dấu phẩy. Ép tốc độ đọc CPS. Gộp cue vụn."""
+Ngắt: hard-break ở hết câu / ngừng dài (>= LONG_PAUSE); ngừng vừa (>= PAUSE_SPLIT) là điểm
+ưu tiên ngắt trong _fill_k (không tách cứng). Ép tốc độ đọc CPS. Gộp cue vụn.
+Gộp cue biên 1-2 từ bị align sai (gap >= ISOLATION_GAP) vào cue kề."""
 import realign.config as config
 from realign.text_metrics import char_count, wrap_two_lines
 
@@ -49,13 +50,14 @@ def _join(words: list[dict]) -> str:
 
 
 def _split_segments(words: list[dict], cfg) -> list[list[dict]]:
-    """Tách words thành segment tại hard-break: hết câu hoặc khoảng ngừng >= PAUSE_SPLIT."""
+    """Tách words thành segment tại hard-break: hết câu, hoặc ngừng DÀI >= LONG_PAUSE.
+    (Ngừng vừa không tách ở đây - nó là điểm ưu tiên ngắt trong _fill_k.)"""
     ends = tuple(cfg.SENTENCE_END)
     segs, cur = [], []
     for w in words:
         if cur:
             prev = cur[-1]
-            if prev["w"].endswith(ends) or (w["start"] - prev["end"]) >= cfg.PAUSE_SPLIT:
+            if prev["w"].endswith(ends) or (w["start"] - prev["end"]) >= cfg.LONG_PAUSE:
                 segs.append(cur)
                 cur = []
         cur.append(w)
@@ -65,21 +67,22 @@ def _split_segments(words: list[dict], cfg) -> list[list[dict]]:
 
 
 def _fill_k(words: list[dict], k: int, cfg) -> list[list[dict]]:
-    """Chia words thành tối đa k nhóm cân bằng (~total/k ký tự mỗi nhóm),
-    ưu tiên ngắt ngay sau dấu phẩy/`;`/`:` khi đã gần target."""
+    """Chia words thành tối đa k nhóm cân bằng (~total/k ký tự), ưu tiên ngắt sau
+    dấu phẩy/`;`/`:` HOẶC tại khoảng ngừng vừa (>= PAUSE_SPLIT) khi đã gần target."""
     target = char_count(_join(words)) / k
     groups, cur = [], []
     for i, w in enumerate(words):
         cur.append(w)
-        if (k - len(groups)) <= 1:                          # nhóm cuối: gom hết phần còn lại
+        if (k - len(groups)) <= 1:
             continue
-        if (len(words) - i - 1) <= (k - len(groups) - 1):   # chừa đủ từ cho các nhóm sau
+        if (len(words) - i - 1) <= (k - len(groups) - 1):
             groups.append(cur)
             cur = []
             continue
         acc = char_count(_join(cur))
         ends_soft = w["w"].endswith((",", ";", ":"))
-        if (acc >= target * 0.6 and ends_soft) or acc >= target:
+        pause_after = (words[i + 1]["start"] - w["end"]) >= cfg.PAUSE_SPLIT
+        if (acc >= target * 0.6 and (ends_soft or pause_after)) or acc >= target:
             groups.append(cur)
             cur = []
     if cur:
@@ -134,6 +137,25 @@ def _enforce_min_display(cues: list[dict], cfg) -> list[dict]:
     return out
 
 
+def _deisolate_boundaries(cues: list[dict], cfg) -> list[dict]:
+    """Gộp cue đầu/cuối chỉ 1-2 từ bị tách bởi gap >= ISOLATION_GAP (align sai biên đầu/cuối
+    file) vào cue kề, bỏ timestamp lệch. Chỉ gộp nếu kết quả vẫn <= 2 dòng <= CPL."""
+    if len(cues) < 2:
+        return cues
+    cues = [dict(c) for c in cues]
+    if (len(cues[0]["text"].split()) <= 2
+            and (cues[1]["start"] - cues[0]["end"]) >= cfg.ISOLATION_GAP
+            and _fits_lines(cues[0]["text"] + " " + cues[1]["text"], cfg)):
+        cues[1]["text"] = cues[0]["text"] + " " + cues[1]["text"]
+        cues = cues[1:]
+    if (len(cues) >= 2 and len(cues[-1]["text"].split()) <= 2
+            and (cues[-1]["start"] - cues[-2]["end"]) >= cfg.ISOLATION_GAP
+            and _fits_lines(cues[-2]["text"] + " " + cues[-1]["text"], cfg)):
+        cues[-2]["text"] = cues[-2]["text"] + " " + cues[-1]["text"]
+        cues = cues[:-1]
+    return cues
+
+
 def build_cues(words: list[dict], cfg=config) -> list[dict]:
     if not words:
         return []
@@ -143,6 +165,7 @@ def build_cues(words: list[dict], cfg=config) -> list[dict]:
         for group in _segment_to_cues(seg, cfg):
             raw.append(_make_cue(group))
     cues = _enforce_min_display(raw, cfg)
+    cues = _deisolate_boundaries(cues, cfg)
     for c in cues:
         c["text"] = wrap_two_lines(c["text"], cfg.CPL_MAX)
     return cues

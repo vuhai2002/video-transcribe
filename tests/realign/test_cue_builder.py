@@ -19,10 +19,29 @@ def test_sentence_split_when_each_cue_meets_min_display():
     assert cues[0]["text"] == "Một." and cues[1]["text"] == "Hai."
 
 
-def test_pause_splits_into_two_cues():
-    # gap 0.7s >= PAUSE_SPLIT (0.6) -> ngắt; mỗi cue kéo đủ 1.5s
-    cues = build_cues([W("alpha", 0.0, 1.6), W("beta", 2.3, 3.9)], cfg)
+def test_long_pause_splits_into_two_cues():
+    # ngừng DÀI 2.4s >= LONG_PAUSE -> tách cứng
+    cues = build_cues([W("alpha", 0.0, 1.6), W("beta", 4.0, 5.6)], cfg)
     assert len(cues) == 2
+
+
+def test_medium_pause_does_not_split_short_sentence():
+    # ngừng vừa 0.8s (>= PAUSE_SPLIT, < LONG_PAUSE) KHÔNG tách câu ngắn
+    words = [W("alpha", 0.0, 0.4), W("beta", 0.5, 0.9),
+             W("gamma", 1.7, 2.1), W("delta", 2.2, 2.6)]   # gap beta->gamma = 0.8s
+    cues = build_cues(words, cfg)
+    assert len(cues) == 1
+
+
+def test_deisolate_leading_misaligned_word():
+    # tu dau "Nam" neo nham 8.3s, than o 54s (gap 44s) -> gop lai, dung timing than
+    body = ["Mô", "Bổn", "Sư", "Phật."]
+    words = [W("Nam", 8.3, 9.8)] + [W(w, 54.0 + i * 0.2, 54.0 + i * 0.2 + 0.15)
+                                    for i, w in enumerate(body)]
+    cues = build_cues(words, cfg)
+    assert len(cues) == 1
+    assert cues[0]["text"].replace("\n", " ").startswith("Nam Mô")
+    assert cues[0]["start"] >= 50.0
 
 
 def test_long_run_splits_to_keep_lines_within_cpl():

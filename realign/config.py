@@ -16,7 +16,9 @@ DUR_MAX = 7.0
 FLOOR = 0.3                       # sàn tuyệt đối
 
 # segmentation
-PAUSE_SPLIT = 0.6                 # lặng giữa 2 từ >= -> ngắt cue
+PAUSE_SPLIT = 0.6                 # ngừng vừa >= -> ĐIỂM ƯU TIÊN ngắt cue (mềm, KHÔNG ép tách)
+LONG_PAUSE = 2.0                  # ngừng dài >= -> tách segment cứng (như hết câu)
+ISOLATION_GAP = 8.0               # cue đầu/cuối 1-2 từ cách cue kề >= ngưỡng này -> align sai biên, gộp lại
 SENTENCE_END = ".!?:;"            # ký tự cuối từ -> ngắt câu
 
 # khoảng cách 2 cue
