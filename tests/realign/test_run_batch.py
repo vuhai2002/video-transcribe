@@ -1,4 +1,6 @@
 import json
+import shutil
+from unittest.mock import patch
 from realign.run_batch import out_paths, should_align, select_pairs, copy_with_retry
 
 
@@ -34,3 +36,21 @@ def test_copy_with_retry_copies(tmp_path):
     dst = tmp_path / "d.bin"
     copy_with_retry(str(src), str(dst))
     assert dst.read_bytes() == b"hello"
+
+
+def test_copy_with_retry_retries_then_succeeds(tmp_path):
+    src = tmp_path / "s.bin"; src.write_bytes(b"x")
+    dst = tmp_path / "d.bin"
+    real_copy = shutil.copyfile
+    calls = {"n": 0}
+
+    def flaky(a, b):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("drive blip")
+        return real_copy(a, b)
+
+    with patch("shutil.copyfile", side_effect=flaky):
+        copy_with_retry(str(src), str(dst), attempts=3, sleep=0)
+    assert calls["n"] == 2
+    assert dst.read_bytes() == b"x"

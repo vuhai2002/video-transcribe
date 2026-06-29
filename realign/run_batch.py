@@ -72,17 +72,22 @@ def process_one(pair, out_dir, device, models, vad_model, emit_chunk_sec, max_se
             tmp = os.path.join(out_dir, "_tmp", os.path.splitext(srt_name)[0] + ".mp3")
             os.makedirs(os.path.dirname(tmp), exist_ok=True)
             copy_with_retry(pair["audio_path"], tmp)
-            words_raw = " ".join(parse_srt_cues(open(pair["srt_path"], encoding="utf-8").read())).split()
-            region = _safe_vad(tmp, vad_model)
-            words = align(tmp, words_raw, device, emit_chunk_sec, max_sec, models=models)
-            os.makedirs(os.path.dirname(words_json), exist_ok=True)
-            json.dump({"key": key, "audio": pair["audio_path"], "vad": region, "words": words},
-                      open(words_json, "w", encoding="utf-8"), ensure_ascii=False)
             try:
-                os.remove(tmp)
-            except OSError:
-                pass
-        data = json.load(open(words_json, encoding="utf-8"))
+                with open(pair["srt_path"], encoding="utf-8") as fh:
+                    words_raw = " ".join(parse_srt_cues(fh.read())).split()
+                region = _safe_vad(tmp, vad_model)
+                words = align(tmp, words_raw, device, emit_chunk_sec, max_sec, models=models)
+                os.makedirs(os.path.dirname(words_json), exist_ok=True)
+                with open(words_json, "w", encoding="utf-8") as fh:
+                    json.dump({"key": key, "audio": pair["audio_path"], "vad": region, "words": words},
+                              fh, ensure_ascii=False)
+            finally:
+                try:
+                    os.remove(tmp)               # xóa temp kể cả khi align lỗi (tránh đầy ổ)
+                except OSError:
+                    pass
+        with open(words_json, encoding="utf-8") as fh:
+            data = json.load(fh)
         region = tuple(data["vad"]) if data.get("vad") else None
         os.makedirs(os.path.dirname(out_srt), exist_ok=True)
         cues = segment(words_json, out_srt, region)
