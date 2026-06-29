@@ -19,21 +19,15 @@ def segment(words_json: str, out_srt: str, vad_region=None, cfg=config) -> list[
     return cues
 
 
-def _load_vad(path):
-    if not path:
-        return None
-    with open(path, encoding="utf-8") as f:
-        d = json.load(f)
-    return (d["first"], d["last"])
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--words-json", required=True)
     ap.add_argument("--out-srt", required=True)
-    ap.add_argument("--vad-json")
     a = ap.parse_args()
-    cues = segment(a.words_json, a.out_srt, _load_vad(a.vad_json))
+    with open(a.words_json, encoding="utf-8") as f:
+        data = json.load(f)
+    region = tuple(data["vad"]) if data.get("vad") else None
+    cues = segment(a.words_json, a.out_srt, region)
     print(f"wrote {len(cues)} cues -> {a.out_srt}")
 
 

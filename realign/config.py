@@ -4,7 +4,7 @@ Xem plans .../reports/subtitle-timing-standards-research.md để biết nguồn
 # cue text
 CPL_MAX = 42                      # ký tự / dòng (đếm sau NFC, theo grapheme)
 LINES_MAX = 2
-CHAR_MAX = CPL_MAX * LINES_MAX    # 84
+CHAR_MAX = CPL_MAX * LINES_MAX    # 84 - chỉ tham chiếu; luật ngắt cue thực tế dùng _fits_lines theo CPL (xem cue_builder)
 
 # tốc độ đọc
 CPS_MAX = 15.0                    # trần cứng
