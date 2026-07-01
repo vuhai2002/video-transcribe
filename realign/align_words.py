@@ -103,6 +103,36 @@ def assemble_words(words_raw, align_idx, token_spans, ratio, sr) -> list[dict]:
     return out
 
 
+def _chunk_bounds(n_samples: int, chunk: int, min_tail: int) -> list[tuple[int, int]]:
+    """Ranh giới các chunk emission; gộp đuôi ngắn (< min_tail) vào chunk cuối để KHÔNG
+    tạo chunk tí hon (chunk quá ngắn làm conv của wav2vec2 báo lỗi 'kernel size')."""
+    bounds: list[tuple[int, int]] = []
+    i = 0
+    while i < n_samples:
+        end = i + chunk
+        if n_samples - end < min_tail:
+            end = n_samples
+        bounds.append((i, end))
+        i = end
+    return bounds
+
+
+def _emission(model, wav, dev, emit_chunk_sec: float, sr: int):
+    """Chunked emission (giới hạn GPU mem) -> tensor [1, frames, vocab] trên CPU.
+    Gộp đuôi ngắn qua _chunk_bounds để không tạo chunk tí hon làm conv lỗi."""
+    import torch
+    chunk = int(emit_chunk_sec * sr)
+    min_tail = int(0.5 * sr)   # chunk cuối không ngắn hơn 0.5s (tránh lỗi conv 'kernel size')
+    ems = []
+    with torch.inference_mode():
+        for start, end in _chunk_bounds(wav.size(1), chunk, min_tail):
+            emi, _ = model(wav[:, start:end].to(dev))
+            ems.append(emi.cpu())
+            if dev.type == "cuda":
+                torch.cuda.empty_cache()
+    return torch.cat(ems, dim=1)
+
+
 def align(
     audio_path: str,
     words_raw: list[str],
@@ -124,15 +154,7 @@ def align(
     align_idx = [i for i, nw in enumerate(norm) if nw]
     align_words_list = [norm[i] for i in align_idx]
     model, tokenizer, aligner = models if models is not None else get_models(dev)
-    chunk = int(emit_chunk_sec * sr)
-    ems = []
-    with torch.inference_mode():
-        for i in range(0, wav.size(1), chunk):
-            emi, _ = model(wav[:, i: i + chunk].to(dev))
-            ems.append(emi.cpu())
-            if dev.type == "cuda":
-                torch.cuda.empty_cache()
-    emission = torch.cat(ems, dim=1)
+    emission = _emission(model, wav, dev, emit_chunk_sec, sr)
     with torch.inference_mode():
         token_spans = aligner(emission[0].to(dev), tokenizer(align_words_list))
     ratio = wav.size(1) / emission.size(1)
