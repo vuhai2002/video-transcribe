@@ -13,6 +13,7 @@ import realign.config as config
 from realign.pair_audio_srt import build_pairs, format_unpaired_report
 from realign.srt_to_txt import parse_srt_cues
 from realign.align_words import align, get_models
+from realign.window_align import window_align
 from realign.segment_cues import segment
 
 try:
@@ -62,7 +63,7 @@ def _safe_vad(path, vad_model):
         return None
 
 
-def process_one(pair, out_dir, device, models, vad_model, emit_chunk_sec, max_sec, force):
+def process_one(pair, out_dir, device, models, vad_model, emit_chunk_sec, max_sec, force, window_sec=0.0):
     key, srt_name = pair["key"], pair["srt_name"]
     words_json, out_srt = out_paths(out_dir, srt_name)
     row = {f: "" for f in MANIFEST_FIELDS}
@@ -76,7 +77,11 @@ def process_one(pair, out_dir, device, models, vad_model, emit_chunk_sec, max_se
                 with open(pair["srt_path"], encoding="utf-8") as fh:
                     words_raw = " ".join(parse_srt_cues(fh.read())).split()
                 region = _safe_vad(tmp, vad_model)
-                words = align(tmp, words_raw, device, emit_chunk_sec, max_sec, models=models)
+                if window_sec > 0:
+                    words = window_align(tmp, words_raw, device, emit_chunk_sec,
+                                         target_window_sec=window_sec, models=models)
+                else:
+                    words = align(tmp, words_raw, device, emit_chunk_sec, max_sec, models=models)
                 os.makedirs(os.path.dirname(words_json), exist_ok=True)
                 with open(words_json, "w", encoding="utf-8") as fh:
                     json.dump({"key": key, "audio": pair["audio_path"], "vad": region, "words": words},
@@ -120,7 +125,7 @@ def run(args):
         for i, p in enumerate(todo, 1):
             t0 = time.time()
             row = process_one(p, args.out_dir, args.device, models, vad_model,
-                              args.emit_chunk_sec, args.max_sec, args.force)
+                              args.emit_chunk_sec, args.max_sec, args.force, args.window_sec)
             wr.writerow(row)
             mf.flush()
             print(f"[{i}/{len(todo)}] {row['status']:5} {row['srt_name'][:45]:45} "
@@ -140,6 +145,8 @@ def main():
     ap.add_argument("--only", default="")
     ap.add_argument("--emit-chunk-sec", type=float, default=config.EMIT_CHUNK_SEC)
     ap.add_argument("--max-sec", type=float, default=0.0)
+    ap.add_argument("--window-sec", type=float, default=0.0,
+                    help="Nếu >0: forced-align theo cửa sổ ~N giây (cho file dài bị OOM)")
     ap.add_argument("--force", action="store_true")
     run(ap.parse_args())
 
