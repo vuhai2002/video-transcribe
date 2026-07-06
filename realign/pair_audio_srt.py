@@ -28,35 +28,37 @@ def index_audio(audio_dirs: list[str]) -> dict[str, str]:
     return idx
 
 
-def build_pairs(srt_dir: str, audio_dirs: list[str]) -> tuple[list[dict], list[dict], list[dict]]:
-    """Ghép .srt <-> .mp3.
+def build_pairs(src_dir: str, audio_dirs: list[str], ext: str = ".srt") -> tuple[list[dict], list[dict], list[dict]]:
+    """Ghép transcript (.srt hoặc .txt) <-> .mp3.
 
     Args:
-        srt_dir: đường dẫn thư mục chứa .srt
+        src_dir: thư mục chứa transcript (.srt hoặc .txt)
         audio_dirs: danh sách thư mục chứa .mp3
+        ext: đuôi nguồn cần ghép (".srt" hoặc ".txt")
 
     Returns:
         (pairs, unpaired_srt, unpaired_audio) với:
-        - pairs: list[dict] = [{"srt_path", "srt_name", "audio_path", "key"}, ...]
-        - unpaired_srt: list[dict] = [{"srt_name", "srt_path", "key"}, ...]
-        - unpaired_audio: list[dict] = [{"audio_name", "audio_path", "key"}, ...]
+        - pairs: [{"srt_path", "srt_name", "kind", "audio_path", "key"}, ...] (kind = "srt"|"txt")
+        - unpaired_srt: [{"srt_name", "srt_path", "key"}, ...]
+        - unpaired_audio: [{"audio_name", "audio_path", "key"}, ...]
     """
-    if not os.path.isdir(srt_dir):
-        raise ValueError(f"srt_dir not found or not a directory: {srt_dir!r}")
+    if not os.path.isdir(src_dir):
+        raise ValueError(f"src_dir not found or not a directory: {src_dir!r}")
     audio_idx = index_audio(audio_dirs)
+    kind = ext.lstrip(".").lower()
     used: set[str] = set()
     pairs, unpaired_srt = [], []
-    for name in sorted(os.listdir(srt_dir)):
-        if not name.lower().endswith(".srt"):
+    for name in sorted(os.listdir(src_dir)):
+        if not name.lower().endswith(ext.lower()):
             continue
         key = normalize_key(os.path.splitext(name)[0])
-        srt_path = os.path.join(srt_dir, name)
+        src_path = os.path.join(src_dir, name)
         if key in audio_idx:
             used.add(key)
-            pairs.append({"srt_path": srt_path, "srt_name": name,
+            pairs.append({"srt_path": src_path, "srt_name": name, "kind": kind,
                           "audio_path": audio_idx[key], "key": key})
         else:
-            unpaired_srt.append({"srt_name": name, "srt_path": srt_path, "key": key})
+            unpaired_srt.append({"srt_name": name, "srt_path": src_path, "key": key})
     unpaired_audio = [{"audio_name": os.path.basename(p), "audio_path": p, "key": k}
                       for k, p in audio_idx.items() if k not in used]
     return pairs, unpaired_srt, unpaired_audio

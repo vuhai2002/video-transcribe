@@ -11,7 +11,7 @@ import time
 
 import realign.config as config
 from realign.pair_audio_srt import build_pairs, format_unpaired_report
-from realign.srt_to_txt import parse_srt_cues
+from realign.srt_to_txt import words_from_file
 from realign.align_words import align, get_models
 from realign.window_align import window_align
 from realign.segment_cues import segment
@@ -27,7 +27,7 @@ MANIFEST_FIELDS = ["key", "srt_name", "audio_name", "status", "words",
 
 def out_paths(out_dir: str, srt_name: str):
     stem = os.path.splitext(srt_name)[0]
-    return os.path.join(out_dir, "words", stem + ".json"), os.path.join(out_dir, "srt", srt_name)
+    return os.path.join(out_dir, "words", stem + ".json"), os.path.join(out_dir, "srt", stem + ".srt")
 
 
 def should_align(words_json: str, force: bool) -> bool:
@@ -74,8 +74,7 @@ def process_one(pair, out_dir, device, models, vad_model, emit_chunk_sec, max_se
             os.makedirs(os.path.dirname(tmp), exist_ok=True)
             copy_with_retry(pair["audio_path"], tmp)
             try:
-                with open(pair["srt_path"], encoding="utf-8") as fh:
-                    words_raw = " ".join(parse_srt_cues(fh.read())).split()
+                words_raw = words_from_file(pair["srt_path"], pair.get("kind", "srt"))
                 region = _safe_vad(tmp, vad_model)
                 if window_sec > 0:
                     words = window_align(tmp, words_raw, device, emit_chunk_sec,
@@ -107,7 +106,9 @@ def process_one(pair, out_dir, device, models, vad_model, emit_chunk_sec, max_se
 
 
 def run(args):
-    pairs, us, ua = build_pairs(args.srt_dir, args.audio_dir or config.AUDIO_DIRS)
+    src_dir = args.txt_dir or args.srt_dir
+    ext = ".txt" if args.txt_dir else ".srt"
+    pairs, us, ua = build_pairs(src_dir, args.audio_dir or config.AUDIO_DIRS, ext)
     os.makedirs(args.out_dir, exist_ok=True)
     with open(os.path.join(args.out_dir, "unpaired-realign.md"), "w", encoding="utf-8") as f:
         f.write(format_unpaired_report(us, ua))
@@ -135,7 +136,8 @@ def run(args):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--srt-dir", required=True)
+    ap.add_argument("--srt-dir", help="thư mục .srt (đúng 1 trong --srt-dir / --txt-dir)")
+    ap.add_argument("--txt-dir", help="thư mục .txt transcript (đúng 1 trong --srt-dir / --txt-dir)")
     ap.add_argument("--audio-dir", action="append")
     ap.add_argument("--out-dir", default="out")
     ap.add_argument("--device", default="cuda")
@@ -148,7 +150,10 @@ def main():
     ap.add_argument("--window-sec", type=float, default=0.0,
                     help="Nếu >0: forced-align theo cửa sổ ~N giây (cho file dài bị OOM)")
     ap.add_argument("--force", action="store_true")
-    run(ap.parse_args())
+    a = ap.parse_args()
+    if bool(a.srt_dir) == bool(a.txt_dir):
+        ap.error("cần đúng MỘT trong --srt-dir hoặc --txt-dir")
+    run(a)
 
 
 if __name__ == "__main__":

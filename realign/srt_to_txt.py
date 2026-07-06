@@ -26,6 +26,16 @@ def srt_to_transcript(srt_text: str) -> str:
     return "\n".join(parse_srt_cues(srt_text))
 
 
+def words_from_file(path: str, kind: str) -> list[str]:
+    """Đọc transcript -> list từ để align. kind='txt': đọc thẳng .split() (transcript thô);
+    'srt': gộp text các cue rồi .split() (bỏ index/timestamp)."""
+    with open(path, encoding="utf-8") as fh:
+        raw = fh.read()
+    if kind == "txt":
+        return raw.split()
+    return " ".join(parse_srt_cues(raw)).split()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--srt", required=True)

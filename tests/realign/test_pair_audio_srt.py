@@ -24,9 +24,25 @@ def test_build_pairs_matches_case_and_diacritic_insensitive(tmp_path):
     assert len(pairs) == 1
     assert pairs[0]["key"] == "dao lam con b"
     assert pairs[0]["srt_name"] == "Đạo làm con B.srt"
+    assert pairs[0]["kind"] == "srt"
     assert pairs[0]["audio_path"].endswith("đạo làm con b.mp3")
     assert [u["srt_name"] for u in unpaired_srt] == ["Khong co audio.srt"]
     assert [u["audio_name"] for u in unpaired_audio] == ["Bai le thua.mp3"]
+
+
+def test_build_pairs_txt_mode_pairs_txt_and_tags_kind(tmp_path):
+    txt_dir = tmp_path / "txt"; txt_dir.mkdir()
+    audio = tmp_path / "a1"; audio.mkdir()
+    (txt_dir / "Góp nhặt cát đá.txt").write_text("Nam Mô", encoding="utf-8")
+    (txt_dir / "Bỏ qua cái srt.srt").write_text("x", encoding="utf-8")   # .srt bị bỏ khi ext=.txt
+    (audio / "gop nhat cat da.mp3").write_bytes(b"")
+
+    pairs, us, ua = build_pairs(str(txt_dir), [str(audio)], ext=".txt")
+
+    assert len(pairs) == 1
+    assert pairs[0]["srt_name"] == "Góp nhặt cát đá.txt"
+    assert pairs[0]["kind"] == "txt"
+    assert pairs[0]["audio_path"].endswith("gop nhat cat da.mp3")
 
 
 def test_format_unpaired_report_lists_both():
